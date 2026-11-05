@@ -1,0 +1,20 @@
+# 构建产物
+dist/
+ObsidianDrop.app/
+*.dmg
+
+# 本机现场日志（含真实用户名与录音记录，不入库）
+现场日志/
+
+# macOS
+.DS_Store
+._*
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+
+# 临时
+*.tmp
+*.log
