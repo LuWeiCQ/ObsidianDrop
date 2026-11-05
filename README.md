@@ -78,7 +78,7 @@ tags:
 需要 **Xcode Command Line Tools**（`xcode-select --install`）与 Apple Silicon Mac。
 
 ```bash
-git clone https://github.com/<your-name>/ObsidianDrop.git
+git clone https://github.com/LuWeiCQ/ObsidianDrop.git
 cd ObsidianDrop
 ./build.sh                      # 编译并安装到 ~/Applications
 ./build.sh /Applications        # 或指定安装目录
