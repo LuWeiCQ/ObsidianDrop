@@ -1,10 +1,16 @@
-# 构建产物
+# 构建与交付产物（可重新生成，不入库）
 dist/
 ObsidianDrop.app/
 *.dmg
+*.sha256
+Resources/AppIcon.iconset/
 
 # 本机现场日志（含真实用户名与录音记录，不入库）
 现场日志/
+
+# 验证过程的中间切片与真实埋点备份（源码已在 Sources/）
+review/*.swift
+review/metrics-备份-*.jsonl
 
 # macOS
 .DS_Store
@@ -17,4 +23,5 @@ ObsidianDrop.app/
 
 # 临时
 *.tmp
+.od-*.tmp
 *.log

@@ -32,9 +32,16 @@ ObsidianDrop 把这一步压成一个动作：**拖／截／说**。库外的东
 | **截屏归档** | 区域 / 整屏 / 单窗口 / 只进剪贴板，四种模式；截屏时小窗自动收纳，不会把自己拍进图里 |
 | **语音灵感** | 点一下开始录音，再点一下结束；端上转写，**音频不出本机**；带实时百分比进度、0 字诊断、音量呼吸反馈 |
 | **自动写笔记** | 每次投递生成一篇 `YYYY-MM-DD 名称.md`，附件按月归档到 `附件/YYYY-MM/`，正文用 `![[...]]` 嵌入 |
+| **菜单栏双触发** | 左键点图标 → 面板从图标下方下拉；右键 → 精简菜单（8 项，其余收进子菜单）。默认下拉形态，老用户升级后保持原来的常驻浮窗 |
+| **全文搜索** | 下拉面板里直接搜库内笔记正文（3000 篇约 3ms），同时并上 Spotlight 的库外文件；↑↓ 选、回车打开 |
+| **使用看板** | 菜单「打开 → 使用看板…」：近 7 天投递量、成功率、平均耗时、打开率、每日柱状与最近记录，点一条直接打开那篇笔记 |
+| **入库前 AI 三场景** | ① 文件 / PDF / Office → 提取文字生成摘要概览；② 语音转写 → 概览 + 正文润色分段 + 常见错病语修正，原文折叠保留；③ 截图 / 图片 → 视觉识别画面内容生成概览、抽出画面文字。压缩包、音视频、文件夹等其他类型沿用旧模板，**不调用模型**。失败/超时/未配置一律降级为「原样入库」，笔记照常生成 |
+| **视觉模型单独配置** | AI 设置里可填视觉模型，留空则跟随文字模型；Key 存系统钥匙串。只发送提取出的文字或压缩后的 JPEG（最长边 ≤2048、≤4 MiB），**不发送音频、原始附件与文件全文** |
+| **重新设计的下拉面板** | 左键图标打开 400×520 面板：投放头图 + 场景徽标 + 搜索 + AI/转写进度条 + 5 行结果 + 底部动作栏；浅/深模式语义色，拖放高亮只画投放面。常驻浮窗（160×176）保持旧外观不变 |
+| **应用图标** | 深色圆角底 + 暖白纸张 + 紫蓝向下箭头 + 青色落点光；`.icns` 十档齐全，菜单栏使用单色 template 图，暗色模式自动适配 |
 | **多目标切换** | 菜单栏随时切换落库目录（默认 `00-收件箱`），设置持久化 |
 | **开机自启** | 基于 `SMAppService`，菜单栏一键开关 |
-| **可诊断** | 内置 `--audio-check` / `--self-test` / `--ui-memo` 等命令，出问题先自证，不用猜 |
+| **可诊断** | 内置 `--audio-check` / `--self-test`（205 项）/ `--ui-memo` / `--search` / `--metrics` / `--ai-test` / `--ai-run --scene` / `--render-preview` 等命令，出问题先自证，不用猜 |
 
 ## 生成的笔记长什么样
 
@@ -116,9 +123,17 @@ BIN=/Applications/ObsidianDrop.app/Contents/MacOS/ObsidianDrop
 | `$BIN --shot full\|area\|window\|clipboard [--target <目录>]` | 截图并归档；`clipboard` 只进剪贴板 |
 | `$BIN --transcribe <音频> [--target <目录>] [--out <文件>]` | 转写一个音频文件并归档 |
 | `$BIN --audio-check [--json]` | 设备与权限诊断（麦克风、语音模型、库路径） |
-| `$BIN --self-test` | 106 项内部不变量自检 |
+| `$BIN --self-test` | 205 项内部不变量自检（含三场景分类、图片编码、润色校验、独占发布、批次预算、B2 布局坐标、下拉尺寸、埋点去重、旧模板兼容） |
+| `$BIN --search <关键词> [--limit N] [--json] [--no-spotlight]` | 库内全文搜索；退出码 0 有结果 / 1 无命中 / 2 用法或库错误 |
+| `$BIN --metrics [--days N] [--json] [--raw]` | 使用看板的口径数据；`--raw` 输出脱敏后的原始事件 |
+| `$BIN --ai-config` / `--ai-set enabled=on base=… model=… vision=… key=…` | 查看 / 写入 AI 配置（Key 写系统钥匙串；`vision` 留空则用文字模型） |
+| `$BIN --ai-test` / `--ai-run <文件或文字>` | 连接测试 / 单次处理，不启动界面（1.6.0 旧用法保留） |
+| `$BIN --ai-run <路径\|文字> --scene auto\|document\|transcript\|image\|legacy --source drop\|transcript\|screenshot --dry-run --json` | 1.7.0 场景化入口：默认只分类、提取，不联网不写库；`--mock-response <JSON>` / `--mock-error timeout\|no-key\|malformed\|vision-unsupported` 用内存假服务 |
+| 上述命令再加 `--archive --vault <临时库>` | 真实落笔记到临时库，端到端核对模板与降级；**`--archive` 必须显式给 `--vault`**，否则 exit 2 |
+| `$BIN --memo-test <文字> [--target]` | 把一段文字当成刚转写完的结果，走完 pending → AI → 笔记，用于验收归档链路 |
+| `$BIN --dashboard` / `--ai-settings` / `--show-dropdown` | 启动界面并直接打开看板 / AI 设置 / 下拉面板（截图与验收用） |
 | `$BIN --ui-memo <音频> [--target] [--vault]` | 走**完整界面链路**跑一轮（录音文件→转写→归档→复位），用于自动化验收 |
-| `$BIN --render-preview <目录>` | 把面板各状态离屏渲染成 PNG（排查排版问题） |
+| `$BIN --render-preview <目录>` | 把面板 21 个状态离屏渲染成 PNG（1–9 为 1.6.0 基线，10–21 为 1.7.0 的 idle/dragover/recording/transcribing/ai×3/success/error/searching/results/empty） |
 | `$BIN --login` | 查看 / 切换开机自启状态 |
 
 约定：`--vault` 只影响本次进程，不写偏好，便于用临时库做隔离测试。
@@ -129,8 +144,11 @@ BIN=/Applications/ObsidianDrop.app/Contents/MacOS/ObsidianDrop
 |---|---|
 | 笔记与附件 | 你选的 Obsidian 库目录内 |
 | 录音临时文件 | `~/Library/Application Support/ObsidianDrop/recordings/`（转写成功后删除） |
-| 待归档队列 | `~/Library/Application Support/ObsidianDrop/pending/`（`.json`，权限 0600，网络中断也不会丢） |
+| 待归档队列 | `~/Library/Application Support/ObsidianDrop/pending/`（`.json`，权限 0600，网络中断也不会丢；同名 `.done` 是「已写过笔记」的标记，只用于防重复归档） |
 | 运行日志 | `~/Library/Logs/ObsidianDrop.log` |
+| 使用埋点 | `~/Library/Application Support/ObsidianDrop/metrics/events.jsonl`（JSONL，0600，只记次数/耗时/哈希后的目录，不记内容） |
+| 看板跳转表 | `~/Library/Application Support/ObsidianDrop/metrics/jump.json`（id → 笔记路径，只在本机，埋点流不含它） |
+| AI Key | 系统钥匙串（服务 `com.lw.obsidiandrop.ai`）；**不在**偏好文件里 |
 | 偏好 | `com.lw.obsidiandrop`（`defaults read` 可看） |
 
 ## 设计上的几个硬决定
@@ -140,7 +158,9 @@ BIN=/Applications/ObsidianDrop.app/Contents/MacOS/ObsidianDrop
 - **录音只写文件，不在录的时候喂识别。** 录音与识别彻底解耦：识别引擎没装好、模型还在下、权限没给，录音都不会丢。
 - **先落盘，再投递。** 转写结果先原子写入待归档队列（`.tmp` → `rename`，0600），写笔记成功才删音频。任何一环崩了，下次启动自动补归档，不会出现「界面说成功了但笔记没有」。
 - **投递不挂在会死的对象上。** 结果用强持有的 sink 投递，不用 `[weak self]`——闭包晚于对象释放执行的话，结果会被静默吞掉。
-- **只新建，不改旧。** 写入范围严格限定在本次投递产生的那一篇笔记。
+- **只新建，不改旧。** 写入范围严格限定在本次投递产生的那一篇笔记；1.7.0 起改为隐藏临时文件 + `fsync` + `link(2)` 原子发布，同名只追加 `-2/-3`，绝不覆盖。
+- **AI 是装饰，不是闸门。** 模型关掉、超时、返回不合规范、类型不支持，笔记都按 1.6.0 的旧模板照常入库；「AI 没生效」永远不会变成「内容没进去」。
+- **原文不被 AI 改写掉。** 转录的润色稿写进正文，原始转写逐行放在折叠 callout 里，可逐字还原；url、编号、代码、英文技术词在解析时逐项校验，缺一项就拒收这次润色。
 - **状态机 + 看门狗。** 界面卡住不影响落库，看门狗恢复界面并从队列补写。
 
 ## 构建与测试
@@ -149,7 +169,7 @@ BIN=/Applications/ObsidianDrop.app/Contents/MacOS/ObsidianDrop
 ./build.sh                              # 编译 + 安装
 bash scripts/regression.sh              # 56 项回归（自动编译，全在临时库里跑）
 BIN=/path/to/ObsidianDrop bash scripts/regression.sh   # 用已有二进制
-$BIN --self-test                        # 106 项内部自检
+$BIN --self-test                        # 205 项内部自检
 ```
 
 回归测试**从不触碰真实 Obsidian 库**：每个用例用 `mktemp` 建临时库并通过 `--vault` 覆盖。

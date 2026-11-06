@@ -31,8 +31,9 @@ if [ -z "${BIN:-}" ]; then
   printf '==> 编译\n'
   if ! xcrun swiftc -O -parse-as-library -swift-version 5 \
       -target arm64-apple-macos13.0 \
-      -framework AppKit -framework AVFoundation -framework Speech \
-      -o "$BIN" "$SRC_DIR/Sources/main.swift" 2>/tmp/od-build.log; then
+      -framework AppKit -framework AVFoundation -framework CoreAudio \
+      -framework Speech -framework Security \
+      -o "$BIN" "$SRC_DIR"/Sources/*.swift 2>/tmp/od-build.log; then
     echo "编译失败："; head -20 /tmp/od-build.log; exit 1
   fi
 fi

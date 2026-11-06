@@ -23,8 +23,9 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleName</key><string>ObsidianDrop</string>
   <key>CFBundleDisplayName</key><string>ObsidianDrop</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.3.15</string>
-  <key>CFBundleVersion</key><string>19</string>
+  <key>CFBundleShortVersionString</key><string>1.7.0</string>
+  <key>CFBundleVersion</key><string>22</string>
+  <key>CFBundleIconFile</key><string>AppIcon.icns</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSUIElement</key><true/>
   <key>NSHighResolutionCapable</key><true/>
@@ -48,8 +49,24 @@ xcrun swiftc \
   -framework AVFoundation \
   -framework CoreAudio \
   -framework Speech \
+  -framework Security \
+  -framework PDFKit \
   -o "$APP/Contents/MacOS/ObsidianDrop" \
-  "$SRC_DIR/Sources/main.swift"
+  "$SRC_DIR"/Sources/*.swift
+
+echo "==> 拷入图标资源"
+# 1.7.0：AppIcon.icns（Finder / Dock / 切换器）+ 菜单栏模板图标。
+# 图标由 tools/make-icon.swift 生成并提交在 Resources/，构建时只复制、不重新生成。
+# 缺资源必须**直接失败**：静默打出没有图标的 app 等于交付了一个看不见的回归。
+for f in AppIcon.icns MenuBarTemplate.png "MenuBarTemplate@2x.png"; do
+  if [ ! -f "$SRC_DIR/Resources/$f" ]; then
+    echo "  ❌ 缺少 Resources/$f —— 先跑：xcrun swiftc -O tools/make-icon.swift -o /tmp/od-make-icon && /tmp/od-make-icon Resources" >&2
+    exit 1
+  fi
+  cp "$SRC_DIR/Resources/$f" "$APP/Contents/Resources/"
+  chmod 0644 "$APP/Contents/Resources/$f"
+done
+/usr/bin/plutil -lint "$APP/Contents/Info.plist" >/dev/null
 
 echo "==> 签名（ad-hoc）"
 codesign --force --deep --sign - "$APP" 2>/dev/null || echo "  签名跳过（不影响运行）"

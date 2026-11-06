@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ObsidianDrop 1.7.0 交付说明</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#171a21; --panel2:#1d212a; --line:#2a2f3a;
+    --text:#e8ebf2; --muted:#98a1b3; --dim:#6f7787;
+    --accent:#5b9dff; --ok:#39c07f; --warn:#e5a13a; --bad:#e2605d;
+    --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+  }
+  @media (prefers-color-scheme: light){
+    :root{ --bg:#f6f7fa; --panel:#fff; --panel2:#f0f2f7; --line:#e2e5ec;
+           --text:#1b1f28; --muted:#5b6478; --dim:#8a93a6; --accent:#2f6fdd; }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+       font:15px/1.65 -apple-system,"PingFang SC","Helvetica Neue",sans-serif;}
+  .wrap{max-width:960px;margin:0 auto;padding:48px 24px 80px}
+  header{border-bottom:1px solid var(--line);padding-bottom:26px;margin-bottom:34px}
+  .kicker{font:600 12px/1 var(--mono);letter-spacing:.14em;color:var(--accent);text-transform:uppercase}
+  h1{font-size:32px;line-height:1.25;margin:14px 0 10px;letter-spacing:-.01em}
+  .sub{color:var(--muted);font-size:15px}
+  .badges{margin-top:16px;display:flex;gap:8px;flex-wrap:wrap}
+  .badge{font:600 11.5px/1 var(--mono);padding:6px 10px;border-radius:999px;
+         border:1px solid var(--line);background:var(--panel2);color:var(--muted)}
+  .badge.ok{color:var(--ok);border-color:rgba(57,192,127,.35)}
+  h2{font-size:20px;margin:42px 0 14px;letter-spacing:-.01em}
+  h3{font-size:15px;margin:24px 0 8px;color:var(--text)}
+  p{color:var(--muted);margin:10px 0}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px 18px 16px}
+  .card h3{margin:0 0 6px;font-size:15px}
+  .card p{margin:0;font-size:13.5px;line-height:1.6}
+  .tag{display:inline-block;font:600 10.5px/1 var(--mono);color:var(--accent);
+       background:rgba(91,157,255,.12);border-radius:6px;padding:4px 7px;margin-bottom:10px}
+  table{width:100%;border-collapse:collapse;margin:14px 0;font-size:13.5px}
+  th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--dim);font-weight:600;font-size:12px;letter-spacing:.03em}
+  td code,code{font-family:var(--mono);font-size:12.5px;background:var(--panel2);
+       padding:2px 5px;border-radius:5px;color:var(--text)}
+  pre{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+      padding:14px 16px;overflow:auto;font-family:var(--mono);font-size:12.5px;
+      line-height:1.6;color:var(--text)}
+  pre code{background:none;padding:0}
+  .callout{background:rgba(91,157,255,.08);border:1px solid rgba(91,157,255,.25);
+           border-radius:12px;padding:14px 16px;margin:18px 0;font-size:13.5px;color:var(--muted)}
+  .callout b{color:var(--text)}
+  .ok{color:var(--ok)} .bad{color:var(--bad)}
+  .muted{color:var(--dim);font-size:12.5px}
+  ul{color:var(--muted);padding-left:20px;font-size:14px}
+  li{margin:5px 0}
+  footer{margin-top:52px;border-top:1px solid var(--line);padding-top:18px;
+         color:var(--dim);font-size:12.5px}
+  .scene{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px}
+  .scene .card{border-left:3px solid var(--accent)}
+  .scene .card.legacy{border-left-color:var(--dim)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div class="kicker">Release Notes</div>
+  <h1>ObsidianDrop 1.7.0<br>AI 分场景，面板重做，补上图标</h1>
+  <div class="sub">文件做摘要 · 转录润色分段改错病语 · 截图识别画面 · 其他类型照旧 · 下拉面板 400×520 · App / 菜单栏 ICON。仍是零依赖、单二进制、只新建笔记。</div>
+  <div class="badges">
+    <span class="badge ok">自检 205 / 205</span>
+    <span class="badge ok">回归 56 / 56</span>
+    <span class="badge ok">E2E 六例通过</span>
+    <span class="badge">macOS 13+ / arm64</span>
+    <span class="badge">MIT</span>
+  </div>
+</header>
+
+<h2>1 AI 从「一条链路」拆成三个场景</h2>
+<p>1.6.0 的 AI 只做一件事：把转写文字交给模型生成标题/摘要/标签。1.7.0 按<strong>投进来的到底是什么</strong>分流，其他类型一律沿用旧模板，不调用模型。</p>
+
+<div class="scene">
+  <div class="card">
+    <span class="tag">document · 文件</span>
+    <h3>摘要概览</h3>
+    <p>Markdown / TXT / CSV、有文字层的 PDF、现代 Office（只读解包 OOXML）、RTF、旧 <code>.doc</code>（<code>textutil</code>）先取出文字，再请求模型生成标题、摘要、标签。取文有 10 MiB 上限，超长截断并在结果里标记。</p>
+  </div>
+  <div class="card">
+    <span class="tag">transcript · 转录</span>
+    <h3>概览 + 润色分段 + 修错病语</h3>
+    <p>除了标题/摘要/标签，还要一份<strong>润色后的正文</strong>：去掉口头赘余、分段、改常见错病语。润色稿写进正文，原始转写逐行放进 <code>[!quote]- 原始转写</code> 折叠块，可逐字还原。</p>
+  </div>
+  <div class="card">
+    <span class="tag">image · 截图</span>
+    <h3>识别画面内容做概览</h3>
+    <p>首帧按 EXIF 方向摆正，最长边压到 2048（不够再 1600 / 1280）、JPEG 白底、≤4 MiB，以 <code>image_url</code> + <code>detail: high</code> 发给视觉模型；画面里清晰可辨的文字单独写进 <code>[!quote]- 画面文字</code>。</p>
+  </div>
+  <div class="card legacy">
+    <span class="tag">legacy · 其他</span>
+    <h3>完全照旧</h3>
+    <p>压缩包、音视频、文件夹、SVG、未知扩展名、扫描版 PDF 等直接走 1.6.0 的文件归档模板，<strong>一个 1.7 字段都不加</strong>，状态记 <code>off</code>（不是 <code>skipped</code>，因此不写 AI 埋点）。</p>
+  </div>
+</div>
+
+<h3>润色稿不是照单全收</h3>
+<p>解析阶段逐项校验：非空、长度落在原文 55%–135%（短文本 ±40%）、URL / 连续数字 / 反引号代码 / 英文技术词等关键项不得丢失。任一项不满足就<strong>拒收这次润色并降级</strong>，正文保持原始转写，笔记照常入库。</p>
+
+<div class="callout">
+  <b>AI 是装饰，不是闸门。</b>关闭、没配 Key、超时、HTTP 4xx/5xx、返回不合规范、视觉模型不支持——一律降级为旧模板；成功但跳过时界面闪「已归档（AI 跳过）」，不报归档失败。整批投递共用一个 12 秒预算，按剩余项数公平分摊，单项卡住不会拖死整批，且全部 Filer / AI / 附件 IO 都在后台队列。
+</div>
+
+<table>
+  <thead><tr><th>状态</th><th>含义</th><th>笔记模板</th></tr></thead>
+  <tbody>
+    <tr><td><code>done</code></td><td>某场景处理成功</td><td>A6.1 文件 / A6.2 图片 / A6.3 转录，含 <code>摘要</code>、<code>AI</code>、<code>AI场景</code></td></tr>
+    <tr><td><code>skipped</code></td><td>处理过但失败 / 降级</td><td>1.6.0 旧模板（转录另加两行跳过说明）</td></tr>
+    <tr><td><code>off</code></td><td>未启用、未配 Key、天生 legacy</td><td>1.6.0 旧模板，逐字一致</td></tr>
+  </tbody>
+</table>
+
+<p class="muted"><code>AIConfig</code> 新增可选的 <code>visionModel</code>，留空回退文字模型；旧配置缺这个键仍能解码。AI 设置窗口多一栏「视觉模型」。</p>
+
+<h2>2 顶部下拉面板重做</h2>
+<p>只重做左键打开的 <code>.dropdown</code>，常驻浮窗（160×176）保持 1.6.0 外观，老用户升级不会同时遇到入口和尺寸变化。</p>
+
+<table>
+  <thead><tr><th>项目</th><th>1.6.0</th><th>1.7.0</th></tr></thead>
+  <tbody>
+    <tr><td>尺寸</td><td>360×432</td><td><strong>400×520</strong></td></tr>
+    <tr><td>头部</td><td>120 高投放卡</td><td>108 高投放面 + 场景徽标 + 头分隔；投放主图标换成统一的「托盘 + 箭头」标记（矢量绘制，不再是 SF Symbol）</td></tr>
+    <tr><td>进度</td><td>只改标题/副标题</td><td>新增 activity 条，显示提取 / 压缩 / 请求 / 解析 / 写入阶段与状态色</td></tr>
+    <tr><td>结果区</td><td>7 行、翻转坐标系</td><td>5 行、默认右下原点、绘制与命中共用同一个 <code>rowFrame</code></td></tr>
+    <tr><td>底部</td><td>无</td><td>打开 Obsidian 按钮 + 当前目标胶囊 + 快捷键提示</td></tr>
+    <tr><td>拖放高亮</td><td>整面板换材质</td><td>只画投放面 2pt 强调边框，搜索/结果降到 0.55 alpha</td></tr>
+    <tr><td>配色</td><td>固定</td><td>浅/深语义色；选中 accent 0.12 / 0.20；外观切换触发重绘</td></tr>
+    <tr><td>结果交互</td><td>单击即打开</td><td>单击只选中，双击或 Return 才打开</td></tr>
+  </tbody>
+</table>
+
+<p>十个状态都有实现与离屏基线：<code>idle / dragover / recording / transcribing / ai(document·transcript·image) / success / error / searching / results / empty</code>，共 12 张新图，加 9 张 1.6.0 老图一起由 <code>--render-preview</code> 输出。</p>
+
+<div class="callout">
+  <b>离屏渲染抓到一个真实视觉 bug。</b><code>PanelPalette.surface</code> 曾把浅色模式的头部表面写成 <code>calibratedWhite: 0, alpha: 0.66</code>（66% 黑块），而规格是白色 66%、两种模式只改透明度。基线图里头部整片发暗、文字对比度全丢，改成恒定白底后复核通过。同时补了所有自绘组件的 <code>viewDidChangeEffectiveAppearance()</code> 重绘，以及离屏「先排版再进状态」的渲染顺序。
+</div>
+
+<h2>3 应用图标（build 22 重新设计）</h2>
+
+<div class="callout">
+  <b>为什么重做。</b>上一版是「深色底 + 纸张 + 折角 + 内容线 + 渐变箭头 + 落点光」，元素太多：缩到 18pt 菜单栏只剩一团白块，16px 列表里几乎糊成方块，看起来就像被压缩过。新标记只保留两个几何——<strong>粗线 U 形托盘 + 悬在上方的向下箭头</strong>，箭头比开口窄一圈，小尺寸才有留白可辨。
+</div>
+
+<div class="cards">
+  <div class="card"><span class="tag">ONE PATH</span><h3>一套坐标，三处复用</h3><p>100×100 设计网格定义在 <code>Sources/LogoMark.swift</code> 与 <code>tools/make-icon.swift</code>：<code>LogoMark</code> 负责面板 40pt 矢量绘制，生成器用同一组坐标输出应用图标与菜单栏模板，改一处三处同步。</p></div>
+  <div class="card"><span class="tag">APP ICON</span><h3>按 macOS 规范收边</h3><p>1024 画布里改用 824×824、圆角 185 的标准底板（旧版 896/208 偏大，在 Finder 里比邻居显大）。标记按内容包围盒缩放，不受网格留白影响。<strong>16/32px 单独简化</strong>：去掉箭杆、加宽三角，避免杆与内壁糊在一起。</p></div>
+  <div class="card"><span class="tag">MENU BAR</span><h3>16×14、左右各留 1px</h3><p><code>MenuBarTemplate.png</code> / <code>@2x.png</code> 仍是 18pt 单色，<code>isTemplate = true</code> 由系统反相；内容不再只占中间 12×15，而是撑到 16×14，浅色/深色菜单栏都立得住。</p></div>
+  <div class="card"><span class="tag">PANEL</span><h3>不再是系统符号</h3><p>头部 40×40 原来用 SF Symbol <code>arrow.down.doc</code>，现在改成 <code>LogoMark</code> 矢量绘制：Retina 下按实际像素重绘，不依赖位图缩放，也不会因为符号自带留白显得小。</p></div>
+  <div class="card"><span class="tag">BUILD</span><h3>缺资源就构建失败</h3><p><code>build.sh</code> 写入 <code>CFBundleIconFile</code>、复制三个必需资源并 <code>plutil -lint</code>；少任何一个直接 exit 1，不会出现「装完没图标但打包成功」。</p></div>
+</div>
+
+<h2>4 不变量：1.6.0 的行为一处没破</h2>
+<ul>
+  <li><strong>只新建笔记</strong>：文件 / 截图 / 转录统一走 <code>ExclusiveNoteWriter</code>，隐藏临时文件 + <code>fsync</code> + <code>link(2)</code> 原子发布，同名只追加 <code>-2/-3</code>，绝不覆盖。</li>
+  <li><strong>旧模板逐字一致</strong>：AI 关闭、失败、旧 <code>done</code> pending（没有润色稿）都保持 1.6.0 的字段与文案；只有真正走过转录场景才升级到 A6.3 的 <code>AI: "模型（耗时）"</code>。</li>
+  <li><strong>pending 队列 / 看门狗 / 恢复去重</strong>保持原样；新增字段全为可选，旧 pending 缺键仍能解码并解释为 <code>.transcript</code>。</li>
+  <li><strong><code>--target</code> 缺值 exit 2</strong>、既有 UserDefaults 键、<code>--ai-run &lt;文字&gt;</code> 旧用法不变。</li>
+  <li>一次投递的 ai 事件与 drop 事件共用 <code>captureId</code>，看板按 id 去重；天生 legacy 不写 ai 事件。</li>
+  <li>Key 仍存系统钥匙串；场景 CLI 用进程内 <code>overrideConfig</code> / <code>overrideKey</code>，不写偏好也不碰钥匙串。</li>
+</ul>
+
+<h2>5 验证</h2>
+<pre><code>$ bash build.sh /tmp/od-build                 ==> 完成，无编译错误
+$ /usr/bin/plutil -lint …/Info.plist           OK
+$ /usr/bin/iconutil -c iconset …/AppIcon.icns  10 个档位
+
+$ ObsidianDrop --self-test
+自检结果：通过 205，失败 0
+
+$ bash scripts/regression.sh
+回归结果：通过 56，失败 0
+
+$ ObsidianDrop --ai-run doc.md   --source drop       --archive --vault V --mock-response doc.json   --json
+{"aiState":"done","scene":"document","template":"document"}
+$ ObsidianDrop --ai-run "&lt;转写&gt;" --source transcript --archive --vault V --mock-response trans.json --json
+{"aiState":"done","scene":"transcript","template":"transcript"}
+$ ObsidianDrop --ai-run shot.png --source screenshot --archive --vault V --mock-response img.json   --json
+{"aiState":"done","scene":"image","template":"image"}
+$ ObsidianDrop --ai-run bundle.zip --source drop     --archive --vault V --json
+{"aiState":"off","scene":"legacy","template":"legacy"}
+$ ObsidianDrop --ai-run shot.png --source screenshot --archive --vault V --mock-error vision-unsupported --json
+{"aiState":"skipped","fallbackReason":"vision-unsupported","template":"legacy"}
+$ ObsidianDrop --ai-run doc.md --dry-run --json
+{"scene":"document","chars":77,"hasPayload":true,"messages":2,"reason":""}
+
+$ ObsidianDrop --render-preview review/ui-1.7.0     21 张 PNG</code></pre>
+<p class="muted">E2E 全部使用内存 <code>MockTransport</code>，不联网、不发真实 Key；<code>--archive</code> 强制显式 <code>--vault</code>，测试笔记只落临时库。落盘笔记逐行对照 A6.1 / A6.2 / A6.3 / A6.6 模板。</p>
+
+<h3>两轮独立复核与最终修补</h3>
+<p>设计由 Codex 出规格，代码由主代理实现，开发完成后交 Codex 做了两轮<strong>只读</strong>复核（首轮 9 条 P1 / 5 条 P2；第二轮又发现 3 条新 P1，并指出首轮 <code>runProcess</code> 超时清理未闭环）。四项遗留全部修掉，逐条证据在 <code>review/修补记录-1.7.0.md</code>：</p>
+<pre><code>旧用法 --ai-run "文字" --target X
+  修复前 → 错误：文件不存在：…/一段测试文字      rc=1   （被当成文件路径）
+  修复后 → AI 未启用（--ai-set enabled=on）     rc=2   （与不带 --target 逐字一致）
+
+旧 --shot full 的来源目录
+  修复前 → 来源目录: /var/folders/…/T
+  修复后 → 来源目录: 本机屏幕截图
+
+归档退出码（A11）  单项成功 0 · 全部失败 1 · 批量部分成功 3（含 succeeded/failed）
+runProcess 超限   12 MiB 假 XLSX → 0.18s 降级 legacy，无挂起、无无界读</code></pre>
+<p class="muted">最终二进制 SHA256 <code>24f2469f5bc42bf081776b28baff5e0d23926f2f2b25013a03b80f9a356cfb06</code>，
+与 app bundle、dmg 内可执行文件三处一致。浅/深 UI 基线各 21 张均由这份最终二进制重生成并存档；
+深色 21 张已由主代理逐张目检并补写结论，见 <code>review/UI-目检记录-1.7.0.md</code> 的深色章节。</p>
+
+<h2>5.1 交付前重新检查（第四轮）</h2>
+<p>用户要求「重新检查」。主代理另做一次独立复核，并让 Codex 在<strong>不采信此前任何结论</strong>的前提下做只读盲检。
+盲检报出 1 个 P0 + 4 个 P1，主代理逐条核代码、跑复现后确认其中 4 条属实、润色稿一条需限定范围，全部修补：</p>
+<ul>
+  <li><strong>P0 恢复查重误删未归档录音</strong>：判重键从「正文前 60 字」改为「整段原文」，命中后不再删音频；新增两段开头相同、结论不同不得误判的自检断言。</li>
+  <li><strong>P1 截图源图先删</strong>：GUI / CLI 都改为只有「零失败 + 确有笔记」才删临时 PNG，失败时弹窗与 stderr 给出源图路径。实测构造归档失败，709 KB 源图完整保留。</li>
+  <li><strong>P1 批量遇一个缺失文件整批中止</strong>：改为单项失败继续归档，退出码回到 0 / 1 / 3。修复前 <code>rc=1</code> 且 0 笔记，修复后 <code>rc=3</code> 且有效项已入库。</li>
+  <li><strong>P1 Tab 焦点按钮无法键盘激活</strong>：两个药丸按钮补 <code>acceptsFirstResponder</code> 与焦点环高亮，Space / Return / Enter 显式分发到截屏、灵感、打开按钮。</li>
+  <li><strong>P1 润色稿可能改写关键事实</strong>：关键项校验扩到所有数字串与中文星期 / 日期，「200元、周五 → 900元、周一」这类改写会被拒绝并降级回旧模板；人名机构名等语义事实无法用正则证明，仍以折叠的原始转写为准。</li>
+</ul>
+<p>按用户反馈「UI 和 ICON 也没变」一并处理：本机 <code>/Applications</code> 里残留 1.3.8 旧版、<code>~/Applications</code> 才是 1.7.0，
+且菜单栏进程可能仍在跑替换前的旧代码；已把新版装到 <code>/Applications</code>、重启进程并刷新图标登记，安装说明也加了「只保留一份」的提示。
+深色「就绪」徽标对比度偏淡同步修正（文字最亮像素 179 → 224），浅 / 深各 21 张基线用最终二进制重生成。</p>
+
+<h2>6 已知限制</h2>
+<ul>
+  <li>视觉识别需要模型本身支持图片输入；不支持时（如 415）会降级成旧模板，笔记照常入库。</li>
+  <li>PDF 无文字层、或超过 10 MiB 的文本，按 legacy 处理，不做 OCR；有文字层但带页码 / 重复页眉的 PDF 也只做顺序拼接，<strong>不剥离页码与页眉</strong>，摘要可能受噪声影响。</li>
+  <li>XLSX 取文按 OOXML XML 顺序拼接共享字符串与单元格值，<strong>未还原工作表名、行列坐标、合并单元格</strong>语义；多表 / 复杂表格的摘要仅供参考，原始文件始终完整保留。</li>
+  <li>截图识别会在启用 AI 且配置视觉模型时，把压缩后的 JPEG 发给模型；关闭 AI 或将视觉模型置空仍会走文字模型（可能不支持图片）——需要完全不发图片时请关闭 AI。</li>
+  <li>转录润色<strong>只做形式校验</strong>：长度、URL、代码、所有数字串、中文星期 / 日期、英文技术词。人名、机构名、否定语气等语义事实无法用正则证明，可能被模型改写；笔记里的折叠「原始转写」始终是逐字原文，以它为准。</li>
+  <li>本机（Mac mini）没有麦克风，录音链路只能用 <code>--record-test</code> / <code>--ui-memo</code> 验；真机录音请在 MacBook 上确认一次。</li>
+  <li>Tab 焦点环、Space / Return 激活按钮、面板外点击收起、深浅外观实时切换、Finder / 启动台图标呈现，仍需在真机上人工确认一次；离屏渲染只能证明静态布局与配色。</li>
+  <li>同一台机器只保留一份 ObsidianDrop（<code>/Applications</code> 与 <code>~/Applications</code> 二选一）。两份共用 Bundle ID 会出现两个菜单栏图标，且系统权限按路径记录，会反复失效。</li>
+  <li>无公证签名（ad-hoc），首次运行需右键 → 打开手动放行。</li>
+</ul>
+
+<footer>
+  ObsidianDrop 1.7.0 · 交付说明 · 2026-11-05 · 与 <code>docs/设计-1.7.0.md</code> A/B/C 规格一致<br>
+  安装包 <code>dist/ObsidianDrop-1.7.0.dmg</code>（约 1.5 MB，build 22 新图标）· SHA256 见同目录 <code>.sha256</code> 文件与交付消息<br>
+  （校验值在打包后才会产生，故不写死在说明页里，避免页内值与安装包自相矛盾）· 源码与验证材料见仓库根目录
+</footer>
+
+</div>
+</body>
+</html>

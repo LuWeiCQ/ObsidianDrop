@@ -6,6 +6,17 @@ import CoreAudio
 import Speech
 import os
 
+/// 截图临时源图的清理闸门（1.7.0 复核修补）。
+///
+/// 以前 GUI / CLI 都是 `Filer.file` 一返回就删临时 PNG，之后才检查失败报告；
+/// 归档失败时库里没有笔记、已复制的附件也会被回滚，临时 PNG 是唯一副本。
+/// 现在只有「零失败 + 确实产出了笔记」才允许删，失败时保留源图并告知路径。
+enum ScreenshotCleanup {
+    static func canDiscard(failures: Int, noteRel: String) -> Bool {
+        failures == 0 && !noteRel.isEmpty
+    }
+}
+
 // MARK: - 常量
 
 enum Cfg {
@@ -16,6 +27,11 @@ enum Cfg {
     static let visibleKey = "panelVisible"
     /// 窗口是否置于底层（不挡其他窗口）
     static let bottomKey = "panelBottom"
+    /// 面板形态：dropdown（菜单栏下拉）/ docked（常驻浮窗）
+    static let modeKey = "panelMode"
+    /// 老版本用过的键。任一存在 → 说明是老用户，升级后迁移成 docked，
+    /// 别把人家常驻了好几版的窗口没收走。
+    static let legacyKeys = [posXKey, posYKey, visibleKey, bottomKey, targetKey, vaultKey]
 
     static var defaultVault: URL {
         URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Obsidian/Main")
@@ -76,10 +92,25 @@ enum Targets {
     }
 
     /// 固定项 + 扫描 10-项目 下的所有项目
+    ///
+    /// P2：按「项目目录 mtime」缓存。菜单每次弹出都会调这里，
+    /// 原来每次都同步 `contentsOfDirectory` + 逐项 `fileExists`，
+    /// 项目一多，右键菜单就有可感知的延迟；而项目目录没变时这个结果不会变。
     static func all(vault: URL) -> [ArchiveTarget] {
-        var list: [ArchiveTarget] = [ArchiveTarget(rel: "00-收件箱", name: "00-收件箱")]
         let fm = FileManager.default
         let projectsDir = vault.appendingPathComponent("10-项目")
+        let attrs = try? fm.attributesOfItem(atPath: projectsDir.path)
+        let mtime = (attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+        let key = vault.standardizedFileURL.path + "#" + String(mtime)
+
+        cacheLock.lock()
+        if let c = cache, c.key == key {
+            cacheLock.unlock()
+            return c.list
+        }
+        cacheLock.unlock()
+
+        var list: [ArchiveTarget] = [ArchiveTarget(rel: "00-收件箱", name: "00-收件箱")]
         if let names = try? fm.contentsOfDirectory(atPath: projectsDir.path) {
             for n in names.sorted() where !n.hasPrefix(".") {
                 var isDir: ObjCBool = false
@@ -91,7 +122,19 @@ enum Targets {
         }
         list.append(ArchiveTarget(rel: "20-领域", name: "20-领域"))
         list.append(ArchiveTarget(rel: "30-资源", name: "30-资源"))
+
+        cacheLock.lock()
+        cache = (key: key, list: list)
+        cacheLock.unlock()
         return list
+    }
+
+    private static let cacheLock = NSLock()
+    private static var cache: (key: String, list: [ArchiveTarget])?
+
+    /// 自检用：清缓存，避免跨用例串味
+    static func invalidateCache() {
+        cacheLock.lock(); cache = nil; cacheLock.unlock()
     }
 }
 
@@ -215,11 +258,22 @@ struct DropOutcome {
     let source: String
     let noteRel: String
     let fileRel: String
+    /// 1.7.0：一次投递的主键，AI 事件与投递事件必须用同一个 id
+    var captureId: String = ""
+    var scene: AIScene = .legacy
+    var aiState: AIState = .off
+    var aiReason: String = ""
 
-    init(source: String = "", noteRel: String, fileRel: String) {
+    init(source: String = "", noteRel: String, fileRel: String,
+         captureId: String = "", scene: AIScene = .legacy,
+         aiState: AIState = .off, aiReason: String = "") {
         self.source = source
         self.noteRel = noteRel
         self.fileRel = fileRel
+        self.captureId = captureId
+        self.scene = scene
+        self.aiState = aiState
+        self.aiReason = aiReason
     }
 }
 
@@ -337,7 +391,8 @@ final class Filer {
             .joined(separator: "\n")
     }
 
-    func file(_ urls: [URL], target rel: String) throws -> BatchReport {
+    func file(_ urls: [URL], target rel: String,
+              contexts: [ArchiveContext]? = nil) throws -> BatchReport {
         guard fm.fileExists(atPath: vault.path) else { throw FilerError.vaultMissing(vault.path) }
 
         // 目标先规范化并校验仍在本库内；越界写法整体拒绝，什么都不写（QA-002）
@@ -368,12 +423,36 @@ final class Filer {
         try fm.createDirectory(at: fileDirRaw, withIntermediateDirectories: true)
         let fileDir = try VaultGuard.ensureInside(fileDirRaw, vault: vault, label: "附件目录")
 
+        // 1.7.0：整批共用一个 12 秒 AI 预算。先做一次不读内容的快速分类，
+        // 算出「还需要请求的项目数」，逐项按剩余预算公平分摊（规格 A4.2）。
+        let cfg = AIConfigStore.config
+        let batch = contexts?.first?.batchBudget
+            ?? AIBatchBudget(cap: cfg.effectiveBudget)
+        let origin = contexts?.first?.source == "screenshot" ? "screenshot" : "drop"
+        // A1：调用方已给出场景时直接用，不在后台再分类一次（也保证 CLI --scene 生效）。
+        let quick: [AIScene] = {
+            if let contexts, contexts.count == urls.count { return contexts.map(\.scene) }
+            return urls.map { SceneRouter.classify(file: $0, origin: origin) }
+        }()
+        var aiLeft = cfg.enabled ? quick.filter { $0.usesModel }.count : 0
+
         // 逐个处理：单个文件失败不再中断整批，成功项与失败项都要留痕（QA-001）
         var report = BatchReport()
-        for src in urls {
+        for (i, src) in urls.enumerated() {
             do {
-                report.outcomes.append(try archive(src, target: target, noteDir: noteDir, fileDir: fileDir))
+                let ctx: ArchiveContext
+                if let contexts, i < contexts.count {
+                    ctx = contexts[i]
+                } else {
+                    ctx = ArchiveContext(source: origin, scene: quick[i], target: normalizedRel,
+                                         sourceURL: src, batchBudget: batch)
+                }
+                report.outcomes.append(try archive(src, target: target, noteDir: noteDir,
+                                                   fileDir: fileDir, context: ctx,
+                                                   aiPending: max(1, aiLeft), config: cfg))
+                if quick[i].usesModel { aiLeft = max(0, aiLeft - 1) }
             } catch {
+                if quick[i].usesModel { aiLeft = max(0, aiLeft - 1) }
                 report.failures.append(BatchFailure(source: src.path, reason: error.localizedDescription))
             }
         }
@@ -381,7 +460,9 @@ final class Filer {
     }
 
     /// 归档单个源文件；失败只抛出这一项的错误
-    private func archive(_ src: URL, target: ArchiveTarget, noteDir: URL, fileDir: URL) throws -> DropOutcome {
+    private func archive(_ src: URL, target: ArchiveTarget, noteDir: URL, fileDir: URL,
+                         context: ArchiveContext, aiPending: Int,
+                         config: AIConfig) throws -> DropOutcome {
         // 源可能是符号链接：解析到真实对象再复制。
         // 否则库内会留下一个指向库外的链接——既不是独立副本，笔记里的「文件」字段
         // 也会变成库外绝对路径，越界检查形同虚设。
@@ -404,8 +485,35 @@ final class Filer {
             throw FilerError.copyFailed(src.lastPathComponent, error.localizedDescription)
         }
 
+        // 1.7.0：分类 → 提取/压缩 → 请求模型，全部在这个后台调用里完成。
+        // 任何一步失败都只是「这一项没有 AI」，笔记照样按 1.6.0 模板落盘。
+        let material = SceneMaterial.prepare(url: src, origin: context.source,
+                                             target: target.rel,
+                                             forcedScene: context.scene)
+        let scene = material.scene
+        var outcome = AISceneOutcome.off
+        if config.enabled {
+            if let input = material.input, scene.usesModel {
+                let budget = context.batchBudget.attemptBudget(pending: aiPending)
+                outcome = AISceneService.process(input, config: config, budget: budget)
+            } else if !material.reason.isEmpty, scene == .legacy {
+                // 原本可摘要但取文失败：仍算一次 skipped（不重发请求）
+                outcome = .skipped(material.reason)
+            }
+            // 天生 legacy 的类型：状态保持 off，不写 ai 事件，由投递事件表达
+        }
+        // AI 事件：一次投递最多一条，且与投递事件共用 captureId
+        if config.enabled, outcome.state != .off,
+           scene.usesModel || outcome.requested || !material.reason.isEmpty {
+            MetricsStore.shared.record(MetricEvent(
+                kind: "ai", ok: outcome.state == .done, target: target.rel,
+                source: context.source, durationMs: outcome.result?.ms ?? 0,
+                captureId: context.captureId, failReason: outcome.reason,
+                ai: outcome.state.rawValue))
+        }
+
         // 生成笔记
-        let noteBase = uniqueURL(in: noteDir, base: "\(day) \(base)", ext: "md")
+        let noteBaseName = "\(day) \(base)"
         let destRel = relPath(dest)
         let linkName = destRel
         let isImage = Filer.imageExts.contains(ext.lowercased())
@@ -422,11 +530,11 @@ final class Filer {
         }
 
         let sizeText = isFolder ? "文件夹" : Filer.humanSize(dest)
-        var srcDir = (src.path as NSString).deletingLastPathComponent
-        let tmpResolved = (NSTemporaryDirectory() as NSString).resolvingSymlinksInPath
-        if (srcDir as NSString).resolvingSymlinksInPath == tmpResolved {
-            srcDir = "本机屏幕截图"
-        }
+        // 来源文案由投递上下文决定，不再「文件在临时目录就当截图」——
+        // 临时目录里的普通图片会被误标，而移到别处的截图又会漏标。
+        let srcDir = context.source == "screenshot"
+            ? "本机屏幕截图"
+            : (src.path as NSString).deletingLastPathComponent
         let stamp = Filer.stampFmt.string(from: Date())
         // 提示里的目录直接取自实际落盘位置，避免和真实路径脱节（QA-005）
         let destDirRel = (destRel as NSString).deletingLastPathComponent
@@ -434,7 +542,8 @@ final class Filer {
             ? "`\(destDirRel)/`，会同步到 iPhone"
             : "`\(destDirRel)/`，会随库同步到手机"
 
-        let front = """
+        // A6.6：关闭 / 失败 / legacy 必须与 1.6.0 逐字一致，一个字段都不能多。
+        let legacyFront = """
         ---
         类型: 文件归档
         文件: \(destRel)
@@ -458,19 +567,77 @@ final class Filer {
         ## 说明
 
         """
-        // 先复制附件、再写笔记：笔记写失败时必须把刚复制的附件也删掉。
-        // 否则会「报告该项失败，但库里已经多了一份附件」，调用方按失败项重试就会重复。
+
+        let front: String
+        if outcome.state == .done, let r = outcome.result, scene.usesModel {
+            // A6.2：画面文字为空时整段 callout 不出现
+            let visible: String
+            if scene == .image, !r.visibleText.isEmpty {
+                let lines = r.visibleText.components(separatedBy: "\n")
+                    .map { "> \($0)" }.joined(separator: "\n")
+                visible = "\n> [!quote]- 画面文字\n" + lines + "\n"
+            } else {
+                visible = ""
+            }
+            let action = scene == .image ? "识别图片并生成概述" : "生成标题/摘要/标签"
+            front = """
+            ---
+            类型: 文件归档
+            文件: \(destRel)
+            归档时间: \(stamp)
+            来源目录: \(srcDir)
+            目标: \(target.rel)
+            摘要: \(Filer.yamlQuoted(r.summary))
+            AI: \(Filer.yamlQuoted("\(r.model)（\(r.ms)ms）"))
+            AI场景: "\(scene.rawValue)"
+            tags:
+            \(Filer.yamlTags([target.tag] + r.tags))
+            ---
+
+            # \(r.title.isEmpty ? base : r.title)
+
+            > [!abstract] 摘要
+            > \(r.summary)
+
+            \(linkLine)
+            \(visible)
+            > [!note] 投递记录
+            > - 原始位置：`\(src.path)`
+            > - 大小：\(sizeText)
+            > - 存放位置：\(placeHint)
+            > - 由 ObsidianDrop 于 \(stamp) 投递到「\(target.rel)」
+            > - 整理：\(r.model) \(action)（\(r.ms)ms）
+
+            ## 说明
+
+            """
+        } else {
+            front = legacyFront
+        }
+
+        // 先复制附件、再独占发布笔记：笔记写失败必须把刚复制的附件也删掉。
+        // link(2) 保证「只新建不覆盖」；同名冲突自动换 -2/-3。
         do {
-            try front.write(to: noteBase, atomically: true, encoding: .utf8)
+            let published = try ExclusiveNoteWriter.publish(text: front, dir: noteDir,
+                                                            base: noteBaseName)
+            return DropOutcome(source: src.path, noteRel: relPath(published),
+                               fileRel: destRel, captureId: context.captureId,
+                               scene: scene, aiState: outcome.state,
+                               aiReason: outcome.reason)
         } catch {
             try? fm.removeItem(at: dest)
-            throw FilerError.noteFailed(noteBase.lastPathComponent, error.localizedDescription)
+            throw FilerError.noteFailed(noteBaseName, error.localizedDescription)
         }
-        return DropOutcome(source: src.path, noteRel: relPath(noteBase), fileRel: destRel)
     }
 
     /// 把一段语音转写文稿写成笔记（不产生附件）
-    func memo(text: String, target rel: String, duration: TimeInterval, engine: String) throws -> DropOutcome {
+    ///
+    /// `ai` 是入库前 AI 处理的结果（1.5.0）。为空时行为与旧版完全一致——
+    /// 这是刻意的：AI 关着/失败/超时，笔记必须和以前长得一模一样，
+    /// 不能出现「这次没摘要、上次有」的随机差异。
+    func memo(text: String, target rel: String, duration: TimeInterval, engine: String,
+              ai: AIResult? = nil, aiState: AIState = .off,
+              sceneResult: AISceneResult? = nil) throws -> DropOutcome {
         guard fm.fileExists(atPath: vault.path) else { throw FilerError.vaultMissing(vault.path) }
 
         let noteDirRaw = try VaultGuard.resolve(target: rel, vault: vault)
@@ -484,15 +651,30 @@ final class Filer {
         let day = Filer.dayFmt.string(from: now)
         let stamp = Filer.stampFmt.string(from: now)
         let hms = Filer.secondFmt.string(from: now)
-        let noteBase = uniqueURL(in: noteDir, base: "\(day) 灵感 \(hms)", ext: "md")
+        let noteBaseName = "\(day) 灵感 \(hms)"
         let dur = Memo.clock(duration)
 
-        // 正文按空行分段，读起来像随手记而不是一整坨
+        // 正文按空行分段，读起来像随手记而不是一整坨（1.6.0 行为，关闭/失败必须逐字保持）
         let paragraphs = text
             .components(separatedBy: CharacterSet.newlines)
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
             .joined(separator: "\n\n")
+
+        // 1.7.0 A6.3：只有拿到润色稿才替换正文；旧 pending 的 done 结果没有润色稿，
+        // 仍旧用原转写，不升级、不重新计费。
+        let polished = sceneResult?.polishedText ?? ""
+        let hasPolish = aiState == .done && !polished.isEmpty
+        let bodyText = hasPolish ? Filer.squeezeBlankLines(polished) : paragraphs
+        let originalQuote: String
+        if hasPolish {
+            let quoted = text.components(separatedBy: CharacterSet.newlines)
+                .map { $0.trimmed.isEmpty ? ">" : "> \($0)" }
+                .joined(separator: "\n")
+            originalQuote = "> [!quote]- 原始转写\n" + quoted + "\n\n"
+        } else {
+            originalQuote = ""
+        }
 
         let body = """
         ---
@@ -501,22 +683,87 @@ final class Filer {
         时长: \(dur)
         目标: \(rel)
         转写: 端上本机（\(engine)）
-        tags:
-        \(Filer.yamlTags(["灵感", target.tag]))
+        \(aiFrontMatter(ai, state: aiState, hasPolish: hasPolish))tags:
+        \(Filer.yamlTags(["灵感", target.tag] + (ai?.tags ?? [])))
         ---
 
-        # 灵感 \(stamp)
+        # \(ai?.title.isEmpty == false ? ai!.title : "灵感 \(stamp)")
 
-        \(paragraphs)
+        \(ai?.summary.isEmpty == false ? "> [!abstract] 摘要\n> \(ai!.summary)\n\n" : "")\(bodyText)
 
-        > [!note] 录制信息
+        \(originalQuote)> [!note] 录制信息
         > - 时长：\(dur)
         > - 转写：Mac 本机完成，未上传云端
-        > - 由 ObsidianDrop 于 \(stamp) 录在「\(rel)」
+        \(aiLine(ai, state: aiState, hasPolish: hasPolish))> - 由 ObsidianDrop 于 \(stamp) 录在「\(rel)」
 
         """
-        try body.write(to: noteBase, atomically: true, encoding: .utf8)
-        return DropOutcome(noteRel: relPath(noteBase), fileRel: "")
+        let published = try ExclusiveNoteWriter.publish(text: body, dir: noteDir,
+                                                        base: noteBaseName)
+        return DropOutcome(noteRel: relPath(published), fileRel: "")
+    }
+
+    /// 段落之间恰好一个空行；行内首尾空白清掉。不改文字内容。
+    static func squeezeBlankLines(_ s: String) -> String {
+        var out: [String] = []
+        var blank = false
+        for raw in s.components(separatedBy: CharacterSet.newlines) {
+            let l = raw.trimmingCharacters(in: .whitespaces)
+            if l.isEmpty {
+                if blank || out.isEmpty { continue }
+                blank = true
+            } else {
+                blank = false
+            }
+            out.append(l)
+        }
+        while out.last?.isEmpty == true { out.removeLast() }
+        return out.joined(separator: "\n")
+    }
+
+    /// 只有**真的处理过**才写这两行。跳过/未启用时写「AI: 跳过」会让笔记里
+    /// 多出一条与内容无关的状态噪音；而完全不写又分不清「没配」和「配了没生效」——
+    /// 折中是：done 写模型名，skipped 写一行原因，off 什么都不写。
+    private func aiFrontMatter(_ ai: AIResult?, state: AIState,
+                               hasPolish: Bool = false) -> String {
+        switch state {
+        case .off, .pending:
+            return ""
+        case .done:
+            guard let ai else { return "" }
+            var s = "摘要: \(Filer.yamlQuoted(ai.summary))\n"
+            if hasPolish {
+                // 1.7.0 A6.3：整个「模型（耗时）」是一个 YAML 标量
+                s += "AI: \(Filer.yamlQuoted("\(ai.model)（\(ai.ms)ms）"))\n"
+                s += "AI场景: \"transcript\"\n"
+            } else {
+                // 1.6.0 的 done pending 没有润色稿：逐字保持旧模板，不升级、不重新计费
+                s += "AI: \(Filer.yamlQuoted(ai.model))（\(ai.ms)ms）\n"
+            }
+            return s
+        case .skipped:
+            return "AI: 跳过（本次未处理，正文为原始转写）\n"
+        }
+    }
+
+    private func aiLine(_ ai: AIResult?, state: AIState,
+                        hasPolish: Bool = false) -> String {
+        switch state {
+        case .done:
+            guard let ai else { return "" }
+            let what = hasPolish ? "润色、分段并生成标题/摘要/标签" : "生成标题/摘要/标签"
+            return "> - 整理：\(ai.model) \(what)（\(ai.ms)ms）\n"
+        case .skipped:
+            return "> - 整理：AI 未生效，正文为原始转写\n"
+        case .off, .pending:
+            return ""
+        }
+    }
+
+    /// YAML 双引号标量：引号与反斜杠转义，换行已在上游清掉
+    static func yamlQuoted(_ s: String) -> String {
+        let e = s.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        return "\"\(e)\""
     }
 
     static func humanSize(_ url: URL) -> String {
@@ -1148,6 +1395,15 @@ enum DiagLog {
     /// 首次访问时才初始化（懒加载），于是日志里「进程已运行」永远是 0.0s。
     private static var startRef = Date()
 
+    /// 缓存的格式化器与句柄：只在 `queue` 上用，见 `append`
+    private static let fmt: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "MM-dd HH:mm:ss.SSS"
+        return f
+    }()
+    private static var handle: FileHandle?
+    private static var written = 0
+
     /// 版本号，取自 Info.plist。
     ///
     /// 1.3.12 的现场日志里**没有版本号**，拿到一份日志也说不清是哪个构建打出来的，
@@ -1191,24 +1447,43 @@ enum DiagLog {
     }
 
     static func write(_ message: String) {
-        let stamp = DateFormatter()
-        stamp.dateFormat = "MM-dd HH:mm:ss.SSS"
-        let line = "[\(stamp.string(from: Date()))] \(message)\n"
-        queue.async {
-            guard let data = line.data(using: .utf8) else { return }
-            let fm = FileManager.default
-            if let attrs = try? fm.attributesOfItem(atPath: url.path),
-               let size = attrs[.size] as? Int, size > limit {
-                try? fm.removeItem(at: url)
+        // P1：DateFormatter 与文件句柄都缓存。
+        // 原实现每条日志 new 一个 DateFormatter + open/seek/close 一次文件，
+        // 转写进度密集时每 0.3s 就有好几条，全花在格式化与 open(2) 上。
+        let now = Date()
+        queue.async { append(message, at: now) }
+    }
+
+    /// 等日志队列排空。
+    /// CLI 路径（`--metrics` / `--search` / `--ai-*`）写完日志就 `exit`，
+    /// 异步队列里的最后几条会被直接丢掉——偏偏那些正是「为什么失败」的解释。
+    static func flush() {
+        queue.sync {}
+    }
+
+    /// 只在日志队列上执行，所有可变状态（handle / written / fmt）因此天然串行
+    private static func append(_ message: String, at date: Date) {
+        let line = "[\(fmt.string(from: date))] \(message)\n"
+        guard let data = line.data(using: .utf8) else { return }
+        let fm = FileManager.default
+        if handle == nil {
+            if !fm.fileExists(atPath: url.path) {
+                fm.createFile(atPath: url.path, contents: nil)
             }
-            if let handle = try? FileHandle(forWritingTo: url) {
-                handle.seekToEndOfFile()
-                handle.write(data)
-                try? handle.close()
-            } else {
-                try? data.write(to: url)
-            }
+            handle = try? FileHandle(forWritingTo: url)
+            handle?.seekToEndOfFile()
+            let attrs = try? fm.attributesOfItem(atPath: url.path)
+            written = (attrs?[.size] as? Int) ?? 0
         }
+        if written > limit {
+            try? handle?.close()
+            handle = nil
+            written = 0
+            try? fm.removeItem(at: url)
+            return append(message, at: date)
+        }
+        handle?.write(data)
+        written += data.count
     }
 }
 
@@ -2112,6 +2387,28 @@ struct PendingMemo: Codable {
     var createdAt: Date
     var attempts: Int
 
+    // 1.5.0：AI 前置处理的结果跟着 pending 一起落盘。
+    // 用可选而不是给默认值，是为了让**旧版写下的 pending 文件**照常解码——
+    // 合成解码器对「非可选 + 默认值」同样要求键存在，缺键就整条读不出来。
+    var aiState: AIState?
+    var aiTitle: String?
+    var aiSummary: String?
+    var aiTags: [String]?
+    /// 模型名与耗时也要落盘：否则崩溃恢复后重写的笔记里会变成「空模型 / 0ms」
+    var aiModel: String?
+    var aiMs: Int?
+
+    // 1.7.0：全部可选 —— 旧版 pending 缺这些键也能照常解码。
+    // aiScene 缺失一律解释为 .transcript：1.6.0 的队列只有转写这一条来源。
+    var aiScene: AIScene?
+    var aiPolishedText: String?
+    var aiVisibleText: String?
+    var aiReason: String?
+    var aiEdits: [AIEdit]?
+
+    var ai: AIState { aiState ?? .off }
+    var scene: AIScene { aiScene ?? .transcript }
+
     var vault: URL { URL(fileURLWithPath: vaultPath) }
 }
 
@@ -2149,8 +2446,14 @@ enum PendingStore {
         enc.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         try enc.encode(m).write(to: tmp, options: .atomic)
         try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tmp.path)
-        _ = try? fm.removeItem(at: final)
-        try fm.moveItem(at: tmp, to: final)
+        // 原子替换：`remove` + `move` 之间有一个窗口，两边都不存在——
+        // 进程正好在这时被杀，那条结果就彻底没了（而它可能是唯一一份文字）。
+        // rename(2) 在同一卷上是原子的，并且保留 tmp 的 0600 权限。
+        if rename(tmp.path, final.path) != 0 {
+            // 极少数情况（跨卷 / 权限）：退回 remove + move，并把错误抛出去
+            _ = try? fm.removeItem(at: final)
+            try fm.moveItem(at: tmp, to: final)
+        }
         return final
     }
 
@@ -2176,15 +2479,114 @@ enum PendingStore {
             .sorted { $0.createdAt < $1.createdAt }
     }
 
-    static func load(id: String) -> PendingMemo? { all().first { $0.id == id } }
+    /// P6：按 id 直接读那一个文件。
+    /// 原实现是 `all().first { … }`——每次调用都要把队列里所有 JSON 读一遍并解码，
+    /// 而归档收尾时连着调两次，队列长时就是 O(N) × 2 的纯浪费。
+    static func load(id: String) -> PendingMemo? {
+        let u = directory.appendingPathComponent("\(id).json")
+        guard let d = try? Data(contentsOf: u) else { return nil }
+        let dec = JSONDecoder()
+        dec.dateDecodingStrategy = .iso8601
+        return try? dec.decode(PendingMemo.self, from: d)
+    }
 
-    static func remove(id: String) {
-        try? FileManager.default.removeItem(at: directory.appendingPathComponent("\(id).json"))
+    @discardableResult
+    static func remove(id: String) -> Bool {
+        ((try? FileManager.default.removeItem(at: directory.appendingPathComponent("\(id).json"))) != nil)
     }
 
     static var count: Int {
         (try? FileManager.default.contentsOfDirectory(atPath: directory.path))?
             .filter { $0.hasSuffix(".json") }.count ?? 0
+    }
+}
+
+/// 「这篇笔记已经落盘了」的凭据。
+///
+/// 归档的顺序是「写笔记 → 删 pending」，中间那段是崩溃窗口：进程正好在这里被杀，
+/// 重启后补归档看到 pending 还在，就会再写一篇内容相同、只差几秒时间戳的笔记。
+/// 用户视角是「明明只录了一次，知识库里出现两条」——而且删了 pending 才算完的话，
+/// 这段窗口非常短但并非不可能（掉电、强杀、内核 panic 都算）。
+///
+/// 所以在删 pending 之前先原子写一个 `<id>.done`，里面记着笔记路径。
+/// 补归档看到它就直接清理，不再写第二篇。
+enum ArchiveMarker {
+    private static func url(_ id: String) -> URL {
+        PendingStore.directory.appendingPathComponent("\(id).done")
+    }
+
+    @discardableResult
+    static func mark(id: String, rel: String) -> Bool {
+        let u = url(id)
+        try? FileManager.default.createDirectory(at: PendingStore.directory,
+                                                 withIntermediateDirectories: true,
+                                                 attributes: [.posixPermissions: 0o700])
+        guard (try? Data(rel.utf8).write(to: u, options: .atomic)) != nil else { return false }
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600],
+                                               ofItemAtPath: u.path)
+        return true
+    }
+
+    static func doneRel(id: String) -> String? {
+        guard let d = try? Data(contentsOf: url(id)),
+              let s = String(data: d, encoding: .utf8), !s.isEmpty else { return nil }
+        return s
+    }
+
+    static func clear(id: String) {
+        try? FileManager.default.removeItem(at: url(id))
+    }
+
+    /// 孤儿标记清扫：标记写完、`clear` 之前又崩了，就会留下一堆没用的 .done。
+    /// 每个目录每进程扫一次（用目录路径做键，自检/CLI 切临时目录时不会互相占位），
+    /// 超过 3 天的删掉——正常路径下它们活不过一次归档。
+    private static var sweptDirs = Set<String>()
+    static func sweepIfNeeded(now: Date = Date()) {
+        let key = PendingStore.directory.path
+        if sweptDirs.contains(key) { return }
+        sweptDirs.insert(key)
+        let fm = FileManager.default
+        guard let items = try? fm.contentsOfDirectory(at: PendingStore.directory,
+                                                      includingPropertiesForKeys: [.contentModificationDateKey],
+                                                      options: [.skipsHiddenFiles]) else { return }
+        for u in items where u.pathExtension == "done" {
+            guard let v = try? u.resourceValues(forKeys: [.contentModificationDateKey]),
+                  let at = v.contentModificationDate,
+                  now.timeIntervalSince(at) > 3 * 86400 else { continue }
+            try? fm.removeItem(at: u)
+        }
+    }
+}
+
+/// 崩溃恢复期的「这段文字是不是已经写成过笔记」判断。
+///
+/// `ArchiveMarker` 只能覆盖「笔记写完 → 标记落盘」之后的那段窗口。真正剩下的
+/// 最后一段是「Filer 写完笔记 → 标记还没落盘」，这段没法用文件标记消掉（要先知道
+/// 笔记路径，而路径是 Filer 里生成的）。
+///
+/// 所以恢复路径上再加一道内容查重：只在补归档时、只对**已经躺了 90 秒以上**的
+/// pending 做。1.7.0 复核修补：以前只比「正文前 60 字」，两段开头相同但内容不同的
+/// 录音会被当成同一条，未归档那条连同音频一起被删。现在要求**整段原文**都出现在
+/// 某篇笔记里才算命中，且命中后绝不删音频（查重只证明写过相似笔记，不证明安全入库）。
+enum RecoveryDedupe {
+    /// 与 `Filer.memo` 完全一致的正文规范化：逐行 trim、去空行、段落间空一行。
+    static func normalize(_ text: String) -> String {
+        text.components(separatedBy: CharacterSet.newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n\n")
+    }
+
+    static func existingNote(vault: URL, text: String, createdAt: Date,
+                             now: Date = Date()) -> String? {
+        guard now.timeIntervalSince(createdAt) > 90 else { return nil }
+        let norm = normalize(text)
+        // 太短的文字（「好」「收到」）查重必然误判，宁可重复写一次也不误删
+        guard norm.count >= 12 else { return nil }
+        let lo = createdAt.timeIntervalSince1970 - 5
+        let hi = createdAt.timeIntervalSince1970 + 600
+        let docs = VaultIndexer.scan(vault: vault).filter { $0.mtime >= lo && $0.mtime <= hi }
+        return docs.first { normalize($0.text).contains(norm) }?.rel
     }
 }
 
@@ -2206,16 +2608,134 @@ enum MemoArchiveQueue {
     /// 把一条 pending 写进笔记。成功后删 pending 与录音，失败保留两者。
     /// 返回 nil 表示「这条已经被别的路径归档完了」，不是错误。
     /// 必须在后台线程调用（Filer 会做文件 IO）。
-    static func archive(_ m: PendingMemo) throws -> DropOutcome? {
+    /// `batch`/`aiPending` 只由 `drain(_:)` 传入：一次补归档共享同一个 12 秒预算
+    /// （规格 A7.1）。单条归档（正常流程 / CLI）不传，仍拿满额预算。
+    static func archive(_ m: PendingMemo, batch: AIBatchBudget? = nil,
+                        aiPending: Int = 1) throws -> DropOutcome? {
         try queue.sync {
             // 已经在别处归档过：pending 被删掉就是唯一事实，别信内存里的状态
             guard FileManager.default.fileExists(atPath: path(m.id)) else { return nil }
+
+            // 上次「笔记写完、pending 还没删」时中断了：这篇已经在库里，只做清理。
+            if let rel = ArchiveMarker.doneRel(id: m.id) {
+                PendingStore.remove(id: m.id)
+                ArchiveMarker.clear(id: m.id)
+                if !m.audioPath.isEmpty { try? FileManager.default.removeItem(atPath: m.audioPath) }
+                DiagLog.write("跳过重复归档：\(m.id) 已写入 \(rel)（上次在删 pending 前中断）")
+                return nil
+            }
+            ArchiveMarker.sweepIfNeeded()
+
+            // AI 前置处理只挂在这里。
+            //
+            // 为什么不能挂界面的「转写完成」回调：那条路会被看门狗恢复、启动补归档、
+            // 轮次被顶掉三条路径绕过，于是同一段文字有时过了 AI、有时没过，而且看不出来。
+            // 这里是全进程唯一的写笔记入口，挂这儿才有「每条都一致」。
+            var memo = m
+            var aiState = m.ai
+            var aiResult = AIResult(title: m.aiTitle ?? "", summary: m.aiSummary ?? "",
+                                    tags: m.aiTags ?? [], model: m.aiModel ?? "",
+                                    ms: m.aiMs ?? 0)
+            var hasAIResult = !aiResult.title.isEmpty || !aiResult.summary.isEmpty
+                || !aiResult.tags.isEmpty
+
+            // 1.7.0：旧 done pending 没有润色稿，恢复成一个「只有标题/摘要」的场景结果，
+            // Filer 会按 1.6.0 的原转写正文落盘，不升级、不重新计费。
+            var sceneResult: AISceneResult?
+            if aiState == .done, hasAIResult {
+                sceneResult = AISceneResult(
+                    scene: .transcript, title: aiResult.title, summary: aiResult.summary,
+                    tags: aiResult.tags, polishedText: m.aiPolishedText ?? "",
+                    visibleText: m.aiVisibleText ?? "", edits: m.aiEdits ?? [],
+                    model: aiResult.model, ms: aiResult.ms, truncated: false)
+            }
+
+            if aiState == .off || aiState == .pending {
+                let cfg = AIConfigStore.config
+                if cfg.enabled {
+                    let input = AISceneInput.transcript(text: m.text, target: m.target,
+                                                        engine: m.engine,
+                                                        duration: m.duration)
+                    // 单条 pending 用完整预算；drain 补归档时整批共用一个 deadline。
+                    let outcome: AISceneOutcome
+                    if let batch {
+                        if let allowed = batch.attemptBudget(pending: aiPending) {
+                            outcome = AISceneService.process(input, config: cfg, budget: allowed)
+                        } else {
+                            outcome = .skipped("批量 AI 预算已耗尽")
+                        }
+                    } else {
+                        outcome = AISceneService.process(input, config: cfg,
+                                                         budget: cfg.effectiveBudget)
+                    }
+                    aiState = outcome.state
+                    if let r = outcome.result {
+                        aiResult = r.legacy
+                        hasAIResult = true
+                        sceneResult = r
+                        memo.aiTitle = r.title
+                        memo.aiSummary = r.summary
+                        memo.aiTags = r.tags
+                        memo.aiModel = r.model
+                        memo.aiMs = r.ms
+                        memo.aiScene = .transcript
+                        memo.aiPolishedText = r.polishedText
+                        memo.aiVisibleText = r.visibleText
+                        memo.aiEdits = r.edits
+                        memo.aiReason = outcome.reason
+                    }
+                    memo.aiState = outcome.state
+                    // 结果写回 pending：进程若在下一步崩掉，重试看到 .done 就不会重复计费
+                    do {
+                        try PendingStore.enqueue(memo)
+                    } catch {
+                        DiagLog.write("AI 结果写回 pending 失败：\(error.localizedDescription)"
+                                      + "（若随后崩溃，这条会重新请求一次）")
+                    }
+                    if outcome.state != .off {
+                        MetricsStore.shared.record(MetricEvent(
+                            kind: "ai", ok: outcome.state == .done, target: m.target,
+                            source: "archive", durationMs: outcome.result?.ms ?? 0,
+                            captureId: m.id, failReason: outcome.reason,
+                            ai: outcome.state.rawValue))
+                    }
+                    if outcome.state == .skipped {
+                        DiagLog.write("AI 处理跳过：\(outcome.reason)（原文照常入库）")
+                    }
+                } else {
+                    aiState = .off
+                }
+            }
+
             let out = try Filer(vault: m.vault).memo(text: m.text, target: m.target,
-                                                     duration: m.duration, engine: m.engine)
+                                                     duration: m.duration, engine: m.engine,
+                                                     ai: hasAIResult ? aiResult : nil,
+                                                     aiState: aiState,
+                                                     sceneResult: sceneResult)
             // **先确认笔记写成功，再删 pending 和录音**。
             // 顺序反了就等于「删完才发现没写成」——1.3.13 的丢数据正是这么来的。
-            PendingStore.remove(id: m.id)
+            // 中间再加一道 done 标记：删 pending 之前崩溃时，补归档不会重复写第二篇。
+            let marked = ArchiveMarker.mark(id: m.id, rel: out.noteRel)
+            let removed = PendingStore.remove(id: m.id)
+            // 只有 pending 真没了才清标记：删失败还留着标记，下次补归档才能认出来
+            if removed {
+                ArchiveMarker.clear(id: m.id)
+            } else {
+                DiagLog.write("pending 删除失败：\(m.id)（标记保留，下次补归档会重试清理）")
+            }
+            if !marked {
+                DiagLog.write("完成标记写入失败：\(m.id)——此刻崩溃会重复写一篇")
+            }
             if !m.audioPath.isEmpty { try? FileManager.default.removeItem(atPath: m.audioPath) }
+
+            // 埋点也放在这个唯一出口：界面、看门狗、启动补归档都从这里走，
+            // 因此每条只会计一次，且不依赖界面是否还活着。
+            let kind = m.source == "file" ? "memo" : (m.source == "record" ? "memo" : "drop")
+            let ev = MetricEvent(kind: kind, ok: true, target: m.target, noteRel: out.noteRel,
+                                 source: "archive", durationMs: Int(m.duration * 1000),
+                                 captureId: m.id, ai: aiState.rawValue)
+            MetricsStore.shared.record(ev)
+            MetricNoteMap.remember(noteId: ev.noteId, rel: out.noteRel)
             return out
         }
     }
@@ -2224,9 +2744,33 @@ enum MemoArchiveQueue {
     @discardableResult
     static func drain(limit: Int = 5) -> (ok: Int, failed: Int) {
         var ok = 0, failed = 0
-        for m in PendingStore.all().prefix(limit) {
+        let list = Array(PendingStore.all().prefix(limit))
+        // A7.1：一次补归档共用同一个 12 秒 AI 预算，按剩余项数公平分摊。
+        // 不这样做的话 5 条 pending 各拿满 12 秒，看门狗恢复一次最长能卡 60 秒。
+        let cfg = AIConfigStore.config
+        let batch = AIBatchBudget(cap: cfg.effectiveBudget)
+        var aiLeft = cfg.enabled
+            ? list.filter { $0.ai == .off || $0.ai == .pending }.count : 0
+        for m in list {
+            let needsAI = m.ai == .off || m.ai == .pending
+            defer { if needsAI { aiLeft = max(0, aiLeft - 1) } }
+            // 恢复路径的内容查重：覆盖「笔记写完、完成标记还没落盘」这一段窗口。
+            // 只在补归档时做，且要求 pending 已躺 90 秒以上，正常流程零开销。
+            let vaultURL = URL(fileURLWithPath: m.vaultPath)
+            if let rel = RecoveryDedupe.existingNote(vault: vaultURL, text: m.text,
+                                                     createdAt: m.createdAt) {
+                PendingStore.remove(id: m.id)
+                ArchiveMarker.clear(id: m.id)
+                // 音频绝不在这里删：内容查重只能证明「库里有一篇含同样全文的笔记」，
+                // 不能证明这段录音已安全入库。误判时源音仍在，可人工恢复。
+                let kept = m.audioPath.isEmpty ? "（无音频）" : "：\(m.audioPath)"
+                DiagLog.write("补归档跳过：\(m.id) 的整段文字已出现在 \(rel)"
+                              + "（上次写完笔记后中断）；已清理 pending，音频保留\(kept)")
+                ok += 1
+                continue
+            }
             do {
-                if let out = try archive(m) {
+                if let out = try archive(m, batch: batch, aiPending: max(1, aiLeft)) {
                     ok += 1
                     DiagLog.write("补归档完成：\(m.id) → \(out.noteRel)（\(m.text.count) 字）")
                 }
@@ -2234,6 +2778,10 @@ enum MemoArchiveQueue {
                 failed += 1
                 DiagLog.write("补归档失败：\(m.id) ｜ \(error.localizedDescription)"
                               + "（pending 与录音都保留）")
+                // 失败也要进看板，否则「成功率」只统计成功路径，永远是 100%
+                MetricsStore.shared.record(MetricEvent(
+                    kind: "memo", ok: false, target: m.target, source: "drain",
+                    failReason: error.localizedDescription, ai: m.ai.rawValue))
             }
         }
         return (ok, failed)
@@ -2470,7 +3018,8 @@ final class MemoSession {
                                         audioPath: audio.path,
                                         source: "record",
                                         createdAt: Date(),
-                                        attempts: 0)
+                                        attempts: 0,
+                                        aiState: AIConfigStore.config.enabled ? .pending : nil)
                     do {
                         try PendingStore.enqueue(m)
                         o.pendingID = m.id
@@ -2645,6 +3194,7 @@ final class BorderView: NSView {
 final class PillButton: NSButton {
     private var hovered = false { didSet { refresh() } }
     private var baseTint: NSColor = .secondaryLabelColor
+    private var symbolName = ""
 
     init(title: String, symbol: String) {
         super.init(frame: .zero)
@@ -2664,24 +3214,51 @@ final class PillButton: NSButton {
 
     required init?(coder: NSCoder) { fatalError() }
 
-    /// 完全不参与命中测试
+    /// 完全不参与命中测试（鼠标由 DropView 统一分发）
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    /// B6.2 复核修补：以前 Tab 链里有这两个按钮，但 NSButton 自绘子类没有
+    /// acceptsFirstResponder，makeFirstResponder 会失败，焦点根本到不了。
+    override var acceptsFirstResponder: Bool { true }
+    private var focused = false { didSet { refresh() } }
+    override func becomeFirstResponder() -> Bool {
+        let ok = super.becomeFirstResponder()
+        if ok { focused = true }
+        return ok
+    }
+    override func resignFirstResponder() -> Bool {
+        let ok = super.resignFirstResponder()
+        if ok { focused = false }
+        return ok
+    }
 
     func setHovered(_ v: Bool) { hovered = v }
 
     /// 录音时会换成「结束」+ 红色
+    ///
+    /// P9：只在**真的变了**的时候改标题与图标。录音期界面每 0.1s 重画一次状态，
+    /// 原来每次都重建一个 NSImage 并让按钮重排文本，55ms 的定时器叠上这个开销，
+    /// 风扇是能听见的。
     func setStyle(title: String, symbol: String, tint: NSColor, tip: String? = nil) {
-        self.title = title
-        image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
-        baseTint = tint
-        if let tip { toolTip = tip }
-        refresh()
+        if self.title != title { self.title = title }
+        if symbolName != symbol {
+            symbolName = symbol
+            image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
+        }
+        if let tip, toolTip != tip { toolTip = tip }
+        if baseTint != tint {
+            baseTint = tint
+            refresh()
+        }
     }
 
     private func refresh() {
-        contentTintColor = hovered ? .controlAccentColor : baseTint
+        contentTintColor = (hovered || focused) ? .controlAccentColor : baseTint
         layer?.backgroundColor = NSColor.labelColor
-            .withAlphaComponent(hovered ? 0.14 : 0.07).cgColor
+            .withAlphaComponent(focused ? 0.20 : (hovered ? 0.14 : 0.07)).cgColor
+        layer?.borderColor = focused
+            ? NSColor.controlAccentColor.withAlphaComponent(0.8).cgColor : nil
+        layer?.borderWidth = focused ? 1.5 : 0
     }
 }
 
@@ -2717,10 +3294,12 @@ final class RingView: NSView {
 
     private func startSpin() {
         guard spinTimer == nil else { return }
-        let t = Timer(timeInterval: 0.055, repeats: true) { [weak self] _ in
+        // P8：转圈只重绘环自己那一小块（原来每帧重绘整个 52×52 视图并连带
+        // 触发父视图合成），频率同时从 18Hz 降到 24Hz——肉眼更顺，开销更低。
+        let t = Timer(timeInterval: 1.0 / 24.0, repeats: true) { [weak self] _ in
             guard let self else { return }
-            self.phase = (self.phase + 0.055).truncatingRemainder(dividingBy: 1)
-            self.needsDisplay = true
+            self.phase = (self.phase + 1.0 / 24.0).truncatingRemainder(dividingBy: 1)
+            self.setNeedsDisplay(self.bounds.insetBy(dx: -2, dy: -2))
         }
         RunLoop.main.add(t, forMode: .common)
         spinTimer = t
@@ -2809,7 +3388,34 @@ final class DropView: NSView {
     private var didDrag = false
     private var hoverAreas: [NSTrackingArea] = []
     private var targetName: String = ""
-    private var iconSymbol = "arrow.down.doc"
+    /// 1.7.0 重新设计：投放态用自绘 LogoMark，状态态仍用系统符号（录音/转写/成功等）
+    private var iconSymbol = "logo"
+
+    // 1.4.0：下拉形态才显示的搜索区。docked（160×176）时整块隐藏，
+    // 面板回到 1.3.15 的样子——不发布一块「占着位置却什么都没有」的区域。
+    // 不设 private：--render-preview 需要填入搜索词出 results/empty 基线
+    let searchField = NSSearchField()
+    private let results = SearchResultsView()
+    private let divider = NSBox()
+    private var wide = false
+    /// 拖动结束后是否把坐标写进偏好（docked 才写）
+    var persistDragPosition = true
+    var onSearchText: ((String) -> Void)?
+    var onPickRow: ((SearchRow) -> Void)?
+    var onEscape: (() -> Void)?
+    /// 底栏「打开 Obsidian」按钮（1.7.0）
+    var onOpenObsidian: (() -> Void)?
+
+    // 1.7.0 下拉面板的新组件；docked 形态整组隐藏，保持 1.6.0 外观。
+    private let surface = DropSurfaceView()
+    private let headerSurface = SceneHeaderView()
+    private let sceneBadge = SceneBadgeView()
+    private let headSep = NSBox()
+    private let activity = ActivityStripView()
+    private let footer = FooterBarView()
+    private let panelBorder = PanelBorderView()
+    private var currentScene: AIScene = .legacy
+    private var currentWork: UIWorkState = .idle
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -2831,11 +3437,18 @@ final class DropView: NSView {
         effect.wantsLayer = true
         effect.layer?.cornerRadius = 20
         effect.layer?.masksToBounds = true
-        effect.alphaValue = 0.97
+        effect.alphaValue = 0.98
+        effect.layer?.cornerRadius = 18
+        layer?.cornerRadius = 18
         addSubview(effect)
 
-        icon.image = NSImage(systemSymbolName: "arrow.down.doc",
-                             accessibilityDescription: "投放")
+        // 头部表面 / 拖放高亮面（规格 B3：在内容之下、材质之上）
+        surface.isHidden = true
+        headerSurface.isHidden = true
+        addSubview(surface)
+        addSubview(headerSurface)
+
+        icon.image = LogoMark.image(pointSize: 40, color: .controlAccentColor)
         icon.contentTintColor = .controlAccentColor
         icon.imageScaling = .scaleProportionallyUpOrDown
         icon.frame = NSRect(x: 0, y: bounds.height - 72, width: bounds.width, height: 46)
@@ -2884,17 +3497,216 @@ final class DropView: NSView {
         memoButton.setStyle(title: "灵感", symbol: "lightbulb",
                             tint: .secondaryLabelColor, tip: "点一下开始录音，说完再点一下就转成文字存进库")
 
-        // 最后一个加入，保证虚线边框绘制在所有内容之上
+        // 搜索区（仅下拉形态可见）。必须加在 borderView 之前，
+        // 否则虚线框会画在输入框上面，看着像「输入框缺了一角」。
+        searchField.placeholderString = "搜索笔记…"
+        searchField.font = .systemFont(ofSize: 12)
+        searchField.controlSize = .small
+        searchField.delegate = self
+        searchField.isHidden = true
+        addSubview(searchField)
+
+        results.isHidden = true
+        results.onPick = { [weak self] _ in
+            guard let self, let row = self.results.selectedRow else { return }
+            self.onPickRow?(row)
+        }
+        addSubview(results)
+
+        divider.boxType = .separator
+        divider.isHidden = true
+        addSubview(divider)
+
+        // 1.7.0：场景徽标 / 头部分隔 / activity / 底栏 / 外轮廓。
+        sceneBadge.isHidden = true
+        addSubview(sceneBadge)
+
+        headSep.boxType = .separator
+        headSep.isHidden = true
+        addSubview(headSep)
+
+        activity.isHidden = true
+        addSubview(activity)
+
+        footer.isHidden = true
+        footer.onOpen = { [weak self] in self?.onOpenObsidian?() }
+        footer.targetPill.title = ""
+        addSubview(footer)
+
+        // 最后一个加入，保证外轮廓绘制在所有内容之上
+        panelBorder.isHidden = true
+        panelBorder.frame = bounds
+        panelBorder.autoresizingMask = [.width, .height]
+        addSubview(panelBorder)
+
         borderView.frame = bounds
         borderView.autoresizingMask = [.width, .height]
         addSubview(borderView)
     }
 
+    /// 两种形态共用一套视图，只按宽度重排。
+    ///
+    /// 1.3.15 的坐标是写死在 `build()` 里的；一旦下拉变成 360 宽，
+    /// 图标和按钮会全挤在左边 160 的范围内，右边一片空白。
     override func layout() {
         super.layout()
         borderView.frame = bounds
-        ring.frame = Self.ringFrame(in: bounds)
+        panelBorder.frame = bounds
+
+        let b = bounds
+        wide = b.width > 240
+        // 1.7.0：下拉形态由 PanelLayout 一处给出全部 frame；docked 完全保持 1.6.0。
+        let chrome: [NSView] = [surface, headerSurface, sceneBadge, headSep,
+                                activity, footer, panelBorder]
+        chrome.forEach { $0.isHidden = !wide }
+        borderView.isHidden = wide
+        searchField.isHidden = !wide
+        results.isHidden = !wide
+        divider.isHidden = !wide
+
+        if wide {
+            let f = PanelLayout.frames(b)
+            surface.frame = f.surface
+            headerSurface.frame = f.header
+            icon.frame = f.icon
+            ring.frame = f.ring
+            title.frame = f.title
+            subtitle.frame = f.subtitle
+            sceneBadge.frame = f.badge
+            sceneBadge.iconOnly = b.width < 360
+            hintLabel.frame = f.hint
+            shotButton.frame = f.shot
+            memoButton.frame = f.memo
+            headSep.frame = f.headSep
+            searchField.frame = f.search
+            activity.frame = f.activity
+            activity.isHidden = f.compact
+            divider.frame = f.resultsSep
+            results.frame = f.results
+            footer.frame = f.footer
+            footer.apply(f)
+
+            title.alignment = .left
+            title.font = .systemFont(ofSize: 15, weight: .semibold)
+            subtitle.alignment = .left
+            subtitle.font = .systemFont(ofSize: 11)
+            hintLabel.alignment = .left
+            hintLabel.font = .systemFont(ofSize: 10)
+            icon.imageScaling = .scaleProportionallyUpOrDown
+            // 新 LogoMark 只有一种形态，形态切换不再换图标；状态图标仍由 setIcon 负责
+            if hintLabel.stringValue == "双击打开 Obsidian"
+                || hintLabel.stringValue == "拖进来即归档 · ⌘F 搜索"
+                || hintLabel.stringValue.isEmpty {
+                hintLabel.stringValue = "拖进来即归档 · ⌘F 搜索"
+            }
+            if currentWork == .idle, title.stringValue == "把文件拖进来" {
+                title.stringValue = "拖入文件，开始整理"
+            }
+        } else {
+            icon.frame = NSRect(x: 0, y: b.height - 72, width: b.width, height: 46)
+            ring.frame = Self.ringFrame(in: b)
+
+            title.alignment = .center
+            title.frame = NSRect(x: 6, y: 72, width: b.width - 12, height: 18)
+            title.font = .systemFont(ofSize: 13, weight: .semibold)
+            subtitle.alignment = .center
+            subtitle.frame = NSRect(x: 8, y: 56, width: b.width - 16, height: 14)
+            subtitle.font = .systemFont(ofSize: 10.5)
+            hintLabel.alignment = .center
+            hintLabel.frame = NSRect(x: 0, y: 42, width: b.width, height: 12)
+            hintLabel.font = .systemFont(ofSize: 9)
+
+            let bw: CGFloat = 68
+            shotButton.frame = NSRect(x: 8, y: 12, width: bw, height: 24)
+            memoButton.frame = NSRect(x: b.width - 8 - bw, y: 12, width: bw, height: 24)
+            if hintLabel.stringValue == "拖进来即归档 · ⌘F 搜索" {
+                hintLabel.stringValue = "双击打开 Obsidian"
+            }
+            if title.stringValue == "拖入文件，开始整理" {
+                title.stringValue = "把文件拖进来"
+            }
+        }
     }
+
+    /// 切到下拉形态（显示搜索区）或回到常驻浮窗
+    func setWide(_ on: Bool) {
+        guard wide != on || searchField.isHidden == on else { return }
+        needsLayout = true
+        layoutSubtreeIfNeeded()
+    }
+
+    func focusSearch() {
+        window?.makeFirstResponder(searchField)
+        searchField.currentEditor()?.selectAll(nil)
+    }
+
+    // MARK: B6.2 Tab 焦点环：search → results → screenshot → memo → open → search
+    /// 只给下拉形态用；docked 没有搜索与结果区，保持 1.6.0 的键盘行为。
+    func focusChain() -> [NSView] {
+        guard wide else { return [] }
+        return [searchField, results, shotButton, memoButton, footer.openButton]
+    }
+
+    /// 焦点环里当前项的索引；字段编辑器要用 delegate 反查 searchField。
+    func focusedIndex() -> Int? {
+        let chain = focusChain()
+        guard !chain.isEmpty else { return nil }
+        let fr = window?.firstResponder
+        return chain.firstIndex { v in
+            if let tv = fr as? NSTextView, let d = tv.delegate,
+               (d as AnyObject) === (v as AnyObject) { return true }
+            if fr === v { return true }
+            return (fr as? NSView)?.isDescendant(of: v) == true
+        }
+    }
+
+    /// B6.2 复核修补：Tab 能聚焦截屏/灵感按钮，但动作只挂在鼠标命中里，
+    /// Space/Return 按下去什么都不会发生。这里把焦点项的动作显式分发出去。
+    func activateFocused() -> Bool {
+        guard wide, let i = focusedIndex() else { return false }
+        let v = focusChain()[i]
+        if v === shotButton { onScreenshot?(); return true }
+        if v === memoButton { onMemo?(); return true }
+        if v === footer.openButton { footer.openButton.performClick(nil); return true }
+        return false
+    }
+
+    func advanceFocus(backwards: Bool) {
+        let chain = focusChain()
+        guard !chain.isEmpty else { return }
+        let current = focusedIndex()
+        let next: Int
+        if let i = current {
+            next = (i + (backwards ? -1 : 1) + chain.count) % chain.count
+        } else {
+            next = backwards ? chain.count - 1 : 0
+        }
+        window?.makeFirstResponder(chain[next])
+        if chain[next] === searchField {
+            searchField.currentEditor()?.selectAll(nil)
+        }
+    }
+
+    func clearSearch() {
+        searchField.stringValue = ""
+        results.setRows([], empty: "")
+    }
+
+    func setResults(_ rows: [SearchRow], empty: String) {
+        // 只保留能看见的行：否则键盘能把选中项移到看不见的地方，鼠标也无从点起。
+        // 1.7.0 下按 PanelLayout 的可见行数（默认 5 行，最小 2 行）裁剪。
+        let usable = wide
+            ? PanelLayout.frames(bounds).visibleRows
+            : max(1, Int((bounds.height - PanelMetrics.dropZoneHeight - 44)
+                         / PanelMetrics.rowHeight))
+        results.setRows(Array(rows.prefix(usable)), empty: empty)
+    }
+
+    func setSearching(_ searching: Bool) {
+        if searching { results.setRows([], empty: "搜索中…") }
+    }
+
+    var searchQuery: String { searchField.stringValue }
 
     /// 进度环的位置：水平居中、垂直居中在图标那块区域上（面板顶部）
     private static func ringFrame(in b: NSRect) -> NSRect {
@@ -2906,11 +3718,18 @@ final class DropView: NSView {
     func setTargetName(_ s: String) {
         targetName = s
         subtitle.stringValue = "→ " + s
+        footer.targetPill.title = s
     }
 
     func flash(_ text: String, ok: Bool) {
         title.stringValue = text
-        title.textColor = ok ? .systemGreen : .systemRed
+        title.textColor = ok ? (PanelPalette.isDark(self) ? PanelPalette.successDark : PanelPalette.success)
+            : (PanelPalette.isDark(self) ? PanelPalette.errorDark : PanelPalette.error)
+        if wide {
+            currentWork = ok ? .done : .failed
+            sceneBadge.state = currentWork
+            activity.set(currentWork, phase: text, detail: "")
+        }
         NSObject.cancelPreviousPerformRequests(withTarget: self, selector: #selector(resetTitle), object: nil)
         perform(#selector(resetTitle), with: nil, afterDelay: 2.5)
     }
@@ -2920,11 +3739,57 @@ final class DropView: NSView {
     /// 回到常规状态（图标、标题、目标名、提示）
     private func restoreIdle() {
         ring.show(.hidden)
-        setIcon("arrow.down.doc", tint: .controlAccentColor)
-        title.stringValue = "把文件拖进来"
+        // 1.7.0 重新设计：下拉与 docked 共用同一个 LogoMark，不再区分实心/线框
+        setIcon("logo", tint: .controlAccentColor)
+        title.stringValue = wide ? "拖入文件，开始整理" : "把文件拖进来"
         title.textColor = .labelColor
         subtitle.stringValue = targetName.isEmpty ? "" : "→ " + targetName
-        hintLabel.stringValue = "双击打开 Obsidian"
+        hintLabel.stringValue = wide ? "拖进来即归档 · ⌘F 搜索" : "双击打开 Obsidian"
+        currentWork = .idle
+        sceneBadge.state = .idle
+        activity.set(.idle, phase: "", detail: "")
+        surface.dragging = false
+        searchField.alphaValue = 1
+        results.alphaValue = 1
+    }
+
+    // MARK: 1.7.0 场景 / AI / 批次状态（规格 B5、B7）
+
+    func renderScene(_ scene: AIScene) {
+        currentScene = scene
+        sceneBadge.scene = scene
+    }
+
+    func renderAI(_ state: UIWorkState, phase: String, detail: String) {
+        currentWork = state
+        sceneBadge.state = state
+        activity.set(state, phase: phase, detail: detail)
+        NSObject.cancelPreviousPerformRequests(withTarget: self,
+                                               selector: #selector(clearAIChrome), object: nil)
+        if state == .done || state == .skipped || state == .failed {
+            perform(#selector(clearAIChrome), with: nil, afterDelay: 2.5)
+        }
+    }
+
+    @objc private func clearAIChrome() {
+        currentWork = .idle
+        sceneBadge.state = .idle
+        activity.set(.idle, phase: "", detail: "")
+    }
+
+    func renderBatch(success: Int, failed: Int) {
+        guard wide else { return }
+        let text = failed == 0 ? "成功 \(success) 个" : "成功 \(success) · 失败 \(failed)"
+        activity.set(failed == 0 ? .done : .failed, phase: text, detail: "")
+    }
+
+    func renderDropActivity(_ on: Bool) {
+        guard wide else { return }
+        if on {
+            renderAI(.working, phase: "提取文字", detail: "请求模型 · 写入笔记")
+        } else if currentWork == .working {
+            clearAIChrome()
+        }
     }
 
     /// 录音/转写状态。partial 是实时转写文字，用来证明「真的在听」。
@@ -2993,23 +3858,64 @@ final class DropView: NSView {
             shotButton.setStyle(title: "截屏", symbol: "camera.viewfinder",
                                 tint: .tertiaryLabelColor, tip: "转写期间不可截屏")
         }
+        if wide { syncMemoChrome(state) }
     }
 
-    /// 图标按名字缓存，避免每 0.1 秒重建一次 NSImage
+    /// 下拉形态下把录音/转写状态映射到场景徽标与 activity 条（只重绘这两块）。
+    private func syncMemoChrome(_ state: MemoUI) {
+        sceneBadge.scene = .transcript
+        switch state {
+        case .idle:
+            currentWork = .idle
+            sceneBadge.state = .idle
+            activity.set(.idle, phase: "", detail: "")
+        case .preparing(let note):
+            currentWork = .working
+            sceneBadge.state = .working
+            activity.set(.working, phase: "准备中", detail: note)
+        case .recording(let elapsed, _):
+            currentWork = .working
+            sceneBadge.state = .working
+            activity.set(.working, phase: "录音中 " + Memo.clock(elapsed),
+                         detail: "说完点结束")
+        case .transcribing(let p):
+            currentWork = .working
+            sceneBadge.state = .working
+            activity.set(.working,
+                         phase: p.stageTitle.isEmpty ? "本机转写" : p.stageTitle,
+                         detail: p.detail.isEmpty ? p.headline : p.detail)
+        }
+    }
+
+    /// 图标按名字缓存，避免每 0.1 秒重建一次 NSImage。
+    /// `logo` 是自绘标记（矢量，随 Retina 重绘），其余仍是系统状态符号。
     private func setIcon(_ symbol: String, tint: NSColor) {
         if iconSymbol != symbol {
             iconSymbol = symbol
-            icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: symbol)
+            if symbol == "logo" {
+                icon.image = LogoMark.image(pointSize: 40, color: tint)
+            } else {
+                icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: symbol)
+            }
         }
         icon.contentTintColor = tint
         icon.alphaValue = 1
     }
 
-    private func setHighlight(_ on: Bool) {
+    // 不设 private：--render-preview 要按真实拖放路径渲染 dragover 基线
+    func setHighlight(_ on: Bool) {
         dragging = on
         borderView.dragging = on
-        effect.material = on ? .selection : .popover
-        title.stringValue = on ? "松手即归档" : "把文件拖进来"
+        if wide {
+            // 1.7.0：高亮只画在投放面，并把搜索/结果降到 0.55，不做整面板材质切换
+            surface.dragging = on
+            searchField.alphaValue = on ? 0.55 : 1
+            results.alphaValue = on ? 0.55 : 1
+        } else {
+            effect.material = on ? .selection : .popover
+        }
+        title.stringValue = on ? "松手即归档"
+            : (wide ? "拖入文件，开始整理" : "把文件拖进来")
         title.textColor = on ? .controlAccentColor : .labelColor
     }
 
@@ -3019,7 +3925,25 @@ final class DropView: NSView {
     // 命中到自己，子视图一律不参与命中，拖到框内任何位置都能进 draggingEntered。
     override func hitTest(_ point: NSPoint) -> NSView? {
         guard let sv = superview else { return super.hitTest(point) }
-        return bounds.contains(convert(point, from: sv)) ? self : nil
+        guard bounds.contains(convert(point, from: sv)) else { return nil }
+        // 下拉形态里，搜索框与结果列表必须自己接事件。
+        // 1.3.15 的「整块命中自己」是为了让投放没有死区，但那会让 1.4.0 的
+        // 搜索框「看得见、点不动」——这里只把这两块让出去，其余仍然归自己。
+        if wide, let hit = super.hitTest(point),
+           hit === searchField || hit.isDescendant(of: searchField) || isInResults(hit)
+            || hit === footer || hit.isDescendant(of: footer) {
+            return hit
+        }
+        return self
+    }
+
+    private func isInResults(_ v: NSView) -> Bool {
+        var cur: NSView? = v
+        while let c = cur, c !== self {
+            if c === results { return true }
+            cur = c.superview
+        }
+        return false
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
@@ -3099,11 +4023,18 @@ final class DropView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         didDrag = false
+        // B6.1：下拉形态不可拖动窗口；但 mouseUp 仍要走按钮命中，所以这里只
+        // 不初始化拖动原点，不能整个 return 掉事件链。
+        guard !wide else { return }
         dragOrigin = NSEvent.mouseLocation
         windowOrigin = window?.frame.origin ?? .zero
     }
 
     override func mouseDragged(with event: NSEvent) {
+        // B6.1：菜单栏下拉是个 popover，被随手拖走就会离开状态栏图标，
+        // 只剩 docked 常驻浮窗允许移动。persistDragPosition 只防「写偏好」，
+        // 拦不住窗口真的被拖走。
+        guard !wide else { return }
         guard let w = window else { return }
         let now = NSEvent.mouseLocation
         let dx = now.x - dragOrigin.x
@@ -3114,7 +4045,9 @@ final class DropView: NSView {
 
     override func mouseUp(with event: NSEvent) {
         if didDrag {
-            if let o = window?.frame.origin {
+            // 下拉面板被拖走后不该覆盖常驻位置，否则下次以 docked 启动
+            // 会出现在一个「上次只是随手拖了一下」的坐标上。
+            if persistDragPosition, let o = window?.frame.origin {
                 UserDefaults.standard.set(Double(o.x), forKey: Cfg.posXKey)
                 UserDefaults.standard.set(Double(o.y), forKey: Cfg.posYKey)
             }
@@ -3137,11 +4070,76 @@ final class DropView: NSView {
     }
 }
 
+// MARK: - 搜索框事件
+
+extension DropView: NSSearchFieldDelegate {
+    func controlTextDidChange(_ obj: Notification) {
+        onSearchText?(searchField.stringValue)
+    }
+
+    /// ↑↓ 选、回车开、ESC 收起。
+    ///
+    /// 不能用 `cancelOperation`：NSSearchField 的字段编辑器先吃掉 ESC，
+    /// 面板根本收不到；必须在字段编辑器的命令层截下来。
+    func control(_ control: NSControl, textView: NSTextView,
+                 doCommandBy commandSelector: Selector) -> Bool {
+        switch commandSelector {
+        case #selector(NSResponder.moveDown(_:)):
+            results.moveSelection(1)
+            return true
+        case #selector(NSResponder.moveUp(_:)):
+            results.moveSelection(-1)
+            return true
+        case #selector(NSResponder.insertNewline(_:)):
+            if let row = results.selectedRow { onPickRow?(row) }
+            return true
+        case #selector(NSResponder.cancelOperation(_:)):
+            onEscape?()
+            return true
+        case #selector(NSResponder.insertTab(_:)):
+            // B6.2：字段编辑器会先吃掉 Tab，不从这里截一道就永远出不了搜索框
+            advanceFocus(backwards: false)
+            return true
+        case #selector(NSResponder.insertBacktab(_:)):
+            advanceFocus(backwards: true)
+            return true
+        default:
+            return false
+        }
+    }
+}
+
 // MARK: - 面板
 
 final class DropPanel: NSPanel {
-    override var canBecomeKey: Bool { false }
+    /// dropdown 形态要接键盘（ESC 收起、搜索框输入）；docked 形态保持「永不成为 key」，
+    /// 否则常驻浮窗会把别的 App 的输入抢走。
+    var mode: PanelMode = .docked
+    var onEscape: (() -> Void)?
+    /// B6.2：Tab 焦点环的控件来自内容视图，面板自己不复制一份坐标。
+    weak var focusRoot: DropView?
+
+    override var canBecomeKey: Bool { mode == .dropdown }
     override var canBecomeMain: Bool { false }
+
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 53 {   // Esc
+            onEscape?()
+            return
+        }
+        // Tab / Shift+Tab：搜索框的字段编辑器走 DropView 的 delegate，
+        // 其余控件到这里；两处共用同一条链，顺序才不会分叉。
+        if mode == .dropdown, event.keyCode == 48 {
+            focusRoot?.advanceFocus(backwards: event.modifierFlags.contains(.shift))
+            return
+        }
+        // Space / Return / Enter：让焦点环里的截屏、灵感、打开按钮也能键盘触发。
+        if mode == .dropdown, [36, 49, 76].contains(event.keyCode),
+           focusRoot?.activateFocused() == true {
+            return
+        }
+        super.keyDown(with: event)
+    }
 }
 
 // MARK: - AppDelegate
@@ -3154,6 +4152,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var targetsMenu: NSMenu?
     private var lastTarget: String = Cfg.storedTarget
     private var capturing = false
+
+    // MARK: 双触发与下拉（1.3.16）
+    private var panelMode: PanelMode = .docked
+    private var popupMenu: NSMenu?
+    private var memoMenuItem: NSMenuItem?
+    private var memoFileItems: [NSMenuItem] = []
+    private var bottomMenuItem: NSMenuItem?
+    private var autoOpenMenuItem: NSMenuItem?
+    private var loginMenuItem: NSMenuItem?
+    private var modeMenuItem: NSMenuItem?
+    /// docked 模式下用户自己拖到的位置；切到 dropdown 再切回来要还原
+    private var dockedOrigin: NSPoint?
+    private var screenObserver: NSObjectProtocol?
+    /// B6.3：点面板外与状态栏图标外立即收起下拉。全局监视器只收其它 App 的事件，
+    /// 本 App 内的点击要靠本地监视器，两个一起装才没有死角。
+    private var outsideClickMonitors: [Any] = []
+
+    // MARK: 搜索与看板（1.4.x）
+    private var searchDebounce: Timer?
+    private var searchSeq = 0
+    private var dashboardWC: DashboardWindowController?
+    private var settingsWC: AISettingsWindowController?
 
     // 灵感录音
     private enum MemoState {
@@ -3228,11 +4248,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // 「是哪个版本、哪台机器、库在哪」都要问用户，白白多一轮沟通。
         DiagLog.header("启动")
         buildStatusItem()
+        migratePanelMode()
         buildPanel()
         lastTarget = Cfg.storedTarget
         dropView.setTargetName(lastTarget)
-        let visible = UserDefaults.standard.object(forKey: Cfg.visibleKey) as? Bool ?? true
-        setPanelVisible(visible)
+        applyPanelModeAtLaunch()
+
+        // P4：换屏 / 改分辨率 / 拔掉外接屏后，把面板夹回当前屏。
+        // 没有这一步，副屏拔掉后窗口会留在不存在的坐标上，用户只能通过菜单复位。
+        screenObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil, queue: .main) { [weak self] _ in
+                self?.clampPanelIntoScreen()
+            }
+        // 切换 Space 后下拉面板会留在旧 Space 的坐标上，看着像「飘走了」
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.activeSpaceDidChangeNotification,
+            object: nil, queue: .main) { [weak self] _ in
+                guard let self, self.panelMode == .dropdown, self.panel.isVisible else { return }
+                self.dismissDropdown()
+            }
+        installOutsideClickMonitors()
         // 失败留下的录音会攒在 Library/Application Support 里，超过 7 天自动清掉
         DispatchQueue.global(qos: .utility).async { RecordingStore.prune() }
 
@@ -3244,6 +4280,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DiagLog.write("启动：发现 \(n) 条待归档结果，开始补归档")
             let r = MemoArchiveQueue.drain()
             DiagLog.write("启动补归档：成功 \(r.ok)，失败 \(r.failed)（失败会继续保留）")
+        }
+
+        // --dashboard / --ai-settings：让看板和设置也能从命令行直达（截图、验收都靠它）
+        if AutoUI.openDashboard {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.openDashboard()
+            }
+        }
+        if AutoUI.openAISettings {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.openAISettings()
+            }
+        }
+        if AutoUI.showDropdown {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                self?.showDropdown(focusSearch: true)
+            }
         }
 
         // --ui-memo：等界面起来后自动跑一轮「转写文件 → 归档 → 复位」，跑完自己退出
@@ -3266,26 +4319,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // 状态栏
+    //
+    // 双触发：左键点图标 → 面板从图标正下方下拉；右键 → 精简菜单。
+    // `statusItem.menu` **永久保持 nil**：一旦挂上菜单，左键就只弹菜单，
+    // 永远收不到 action。也刻意不用「临时挂上再 performClick」的写法——
+    // 那依赖同步阻塞，状态残留过一次就很难查。
     private func buildStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let b = statusItem.button {
-            b.image = NSImage(systemSymbolName: "tray.and.arrow.down.fill",
-                              accessibilityDescription: "ObsidianDrop")
+            b.image = AppIcon.menuBarImage()
             b.image?.isTemplate = true
+            b.target = self
+            b.action = #selector(statusItemClicked(_:))
+            b.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
-        rebuildMenu()
+        statusItem.menu = nil
+        buildMenu()
     }
 
-    private func rebuildMenu() {
-        let m = NSMenu()
-        m.addItem(withTitle: "显示/隐藏 投放窗口", action: #selector(togglePanel), keyEquivalent: "").target = self
-        m.addItem(withTitle: "把窗口移到右下角", action: #selector(resetPosition), keyEquivalent: "").target = self
+    @objc private func statusItemClicked(_ sender: NSStatusBarButton) {
+        guard let event = NSApp.currentEvent else { return }
+        if event.type == .rightMouseUp || event.modifierFlags.contains(.control) {
+            presentMenu(with: event, in: sender)
+        } else {
+            togglePanel()
+        }
+    }
 
-        let bottom = NSMenuItem(title: "窗口置于底层（不挡其他窗口）",
-                                action: #selector(toggleBottom), keyEquivalent: "")
-        bottom.target = self
-        bottom.state = UserDefaults.standard.bool(forKey: Cfg.bottomKey) ? .on : .off
-        m.addItem(bottom)
+    private func presentMenu(with event: NSEvent, in view: NSView) {
+        let menu = popupMenu ?? { buildMenu(); return popupMenu }() ?? NSMenu()
+        refreshMenuState(menu)
+        NSMenu.popUpContextMenu(menu, with: event, for: view)
+    }
+
+    /// 菜单只建一次。1.3.15 的 `rebuildMenu()` 被 13 处调用，每次都 new 一整套
+    /// NSMenu（16 个可见项 + 3 个子菜单），其中一处还在转写进度里每 0.3–0.4 秒调一次。
+    private func buildMenu() {
+        guard popupMenu == nil else { return }
+        let m = NSMenu()
+        m.delegate = self
+
+        let panelItem = NSMenuItem(title: "面板", action: #selector(menuTogglePanel), keyEquivalent: "")
+        panelItem.target = self
+        m.addItem(panelItem)
+
+        // 1.4.0 加的第八项：搜索必须跟功能同版本上线，否则点开是空面板
+        let searchItem = NSMenuItem(title: "搜索笔记…", action: #selector(menuSearch), keyEquivalent: "f")
+        searchItem.target = self
+        m.addItem(searchItem)
 
         let shotHeader = NSMenuItem(title: "截图", action: nil, keyEquivalent: "")
         let shotMenu = NSMenu()
@@ -3297,27 +4378,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         shotHeader.submenu = shotMenu
         m.addItem(shotHeader)
 
-        let memoItem = NSMenuItem(title: memoMenuTitle, action: #selector(startOrStopMemo), keyEquivalent: "")
-        memoItem.target = self
-        memoItem.isEnabled = memoState != .transcribing
-        m.addItem(memoItem)
+        let memoHeader = NSMenuItem(title: "灵感", action: nil, keyEquivalent: "")
+        let memoMenu = NSMenu()
+        memoMenuItem = NSMenuItem(title: memoMenuTitle, action: #selector(startOrStopMemo), keyEquivalent: "")
+        memoMenuItem?.target = self
+        memoMenu.addItem(memoMenuItem!)
 
         // 没有麦克风的机器（比如 Mac mini）用这条：直接转写已有的音频文件
         let memoFileItem = NSMenuItem(title: "转写音频文件…",
                                       action: #selector(transcribeAudioFile), keyEquivalent: "")
         memoFileItem.target = self
-        memoFileItem.isEnabled = memoState == .idle
-        m.addItem(memoFileItem)
+        memoMenu.addItem(memoFileItem)
+        memoFileItems.append(memoFileItem)
 
-        // 兜底入口：文件在面板里被系统置灰（常见于外部拷来的文件）时，
-        // 在 Finder 里 ⌘C 复制它，再点这里，绕开面板判定。
+        // 兜底入口：文件被系统置灰（常见于外部拷来的 `brok` 文件）时，
+        // 在 Finder 里 ⌘C 复制它，再点这里，绕开 NSOpenPanel 的类型判定。
+        // 这是唯一绕不过去的自救路径，不能删。
         let memoClipItem = NSMenuItem(title: "转写剪贴板里的音频",
                                       action: #selector(transcribeAudioFromClipboard), keyEquivalent: "")
         memoClipItem.target = self
-        memoClipItem.isEnabled = memoState == .idle
-        m.addItem(memoClipItem)
-
-        m.addItem(.separator())
+        memoMenu.addItem(memoClipItem)
+        memoFileItems.append(memoClipItem)
+        memoHeader.submenu = memoMenu
+        m.addItem(memoHeader)
 
         let targetHeader = NSMenuItem(title: "投递目标", action: nil, keyEquivalent: "")
         let sub = NSMenu()
@@ -3327,27 +4410,82 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         targetHeader.submenu = sub
         m.addItem(targetHeader)
 
+        let openHeader = NSMenuItem(title: "打开", action: nil, keyEquivalent: "")
+        let openMenu = NSMenu()
+        addOpenItem(openMenu, "Obsidian", #selector(openObsidian))
+        addOpenItem(openMenu, "库目录", #selector(openVault))
+        addOpenItem(openMenu, "附件目录", #selector(openAttachments))
+        // 出问题时要的第一样东西就是日志，别让用户去 Finder 里一层层翻。
+        // 「复制日志路径」已删除：日志第一行就打印了路径。
+        addOpenItem(openMenu, "运行日志", #selector(openLog))
+        openMenu.addItem(.separator())
+        addOpenItem(openMenu, "使用看板…", #selector(openDashboard))
+        openMenu.addItem(.separator())
+        addOpenItem(openMenu, "AI 模型配置…", #selector(openAISettings))
+        openHeader.submenu = openMenu
+        m.addItem(openHeader)
+
+        let settingsHeader = NSMenuItem(title: "设置", action: nil, keyEquivalent: "")
+        let settings = NSMenu()
+        bottomMenuItem = NSMenuItem(title: "窗口置于底层（不挡其他窗口）",
+                                    action: #selector(toggleBottom), keyEquivalent: "")
+        bottomMenuItem?.target = self
+        settings.addItem(bottomMenuItem!)
+
+        let reset = NSMenuItem(title: "复位窗口位置", action: #selector(resetPosition), keyEquivalent: "")
+        reset.target = self
+        settings.addItem(reset)
+
+        autoOpenMenuItem = NSMenuItem(title: "投递后打开新笔记",
+                                      action: #selector(toggleAutoOpen), keyEquivalent: "")
+        autoOpenMenuItem?.target = self
+        settings.addItem(autoOpenMenuItem!)
+
+        loginMenuItem = NSMenuItem(title: "开机自动启动", action: #selector(toggleLogin), keyEquivalent: "")
+        loginMenuItem?.target = self
+        settings.addItem(loginMenuItem!)
+
+        modeMenuItem = NSMenuItem(title: "恢复菜单栏下拉模式",
+                                  action: #selector(togglePanelMode), keyEquivalent: "")
+        modeMenuItem?.target = self
+        settings.addItem(modeMenuItem!)
+        settingsHeader.submenu = settings
+        m.addItem(settingsHeader)
+
         m.addItem(.separator())
-        m.addItem(withTitle: "打开 Obsidian", action: #selector(openObsidian), keyEquivalent: "").target = self
-        m.addItem(withTitle: "打开库目录", action: #selector(openVault), keyEquivalent: "").target = self
-        m.addItem(withTitle: "打开附件目录", action: #selector(openAttachments), keyEquivalent: "").target = self
-        // 出问题时要的第一样东西就是日志。别让用户去 Finder 里一层层翻。
-        m.addItem(withTitle: "打开运行日志", action: #selector(openLog), keyEquivalent: "").target = self
-        m.addItem(withTitle: "复制日志路径", action: #selector(copyLogPath), keyEquivalent: "").target = self
+        let quit = NSMenuItem(title: "退出", action: #selector(quit), keyEquivalent: "q")
+        quit.target = self
+        m.addItem(quit)
 
-        let autoOpen = NSMenuItem(title: "投递后打开新笔记", action: #selector(toggleAutoOpen), keyEquivalent: "")
-        autoOpen.target = self
-        autoOpen.state = UserDefaults.standard.bool(forKey: "autoOpenNote") ? .on : .off
-        m.addItem(autoOpen)
+        popupMenu = m
+        refreshMenuState(m)
+    }
 
-        let login = NSMenuItem(title: "开机自动启动", action: #selector(toggleLogin), keyEquivalent: "")
-        login.target = self
-        login.state = isLoginEnabled() ? .on : .off
-        m.addItem(login)
+    /// 只改会变的那几项（标题 / 勾选 / 可用性）
+    private func refreshMenuState(_ m: NSMenu? = nil) {
+        guard let menu = m ?? popupMenu else { return }
+        guard let panelItem = menu.items.first else { return }
+        panelItem.title = panelMode == .docked
+            ? (panel?.isVisible == true ? "隐藏投放窗口" : "显示投放窗口")
+            : "打开下拉面板"
+        memoMenuItem?.title = memoMenuTitle
+        memoMenuItem?.isEnabled = memoState != .transcribing
+        for it in memoFileItems { it.isEnabled = memoState == .idle }
+        bottomMenuItem?.state = UserDefaults.standard.bool(forKey: Cfg.bottomKey) ? .on : .off
+        autoOpenMenuItem?.state = UserDefaults.standard.bool(forKey: "autoOpenNote") ? .on : .off
+        loginMenuItem?.state = isLoginEnabled() ? .on : .off
+        modeMenuItem?.title = panelMode == .docked ? "恢复菜单栏下拉模式" : "改为常驻浮窗"
+    }
 
-        m.addItem(.separator())
-        m.addItem(withTitle: "退出", action: #selector(quit), keyEquivalent: "q").target = self
-        statusItem.menu = m
+    /// 兼容旧调用点：语义从「重建」变成「刷新」
+    private func rebuildMenu() {
+        if popupMenu == nil { buildMenu() } else { refreshMenuState() }
+    }
+
+    private func addOpenItem(_ menu: NSMenu, _ title: String, _ action: Selector) {
+        let it = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        it.target = self
+        menu.addItem(it)
     }
 
     /// 重建「投递目标」列表。每次菜单打开前都会调用，
@@ -3372,7 +4510,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // 面板
     private func buildPanel() {
-        let size = NSSize(width: 160, height: 176)
+        let size = PanelMetrics.docked
         panel = DropPanel(contentRect: NSRect(origin: .zero, size: size),
                           styleMask: [.borderless, .nonactivatingPanel],
                           backing: .buffered, defer: false)
@@ -3381,19 +4519,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         panel.backgroundColor = .clear
         panel.hasShadow = true
         panel.isMovableByWindowBackground = false
-        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
         panel.hidesOnDeactivate = false
+        panel.mode = panelMode
+        panel.onEscape = { [weak self] in self?.dismissDropdown() }
 
         dropView = DropView(frame: NSRect(origin: .zero, size: size))
         dropView.onDrop = { [weak self] urls in self?.handleDrop(urls) }
         dropView.onDoubleClick = { [weak self] in self?.openObsidian() }
+        dropView.onOpenObsidian = { [weak self] in self?.openObsidian() }
         dropView.onScreenshot = { [weak self] in self?.takeScreenshot(.area) }
         dropView.onMemo = { [weak self] in self?.startOrStopMemo() }
         dropView.onRightClick = { [weak self] event in
-            guard let self, let m = self.statusItem.menu else { return }
-            NSMenu.popUpContextMenu(m, with: event, for: self.dropView)
+            guard let self else { return }
+            self.presentMenu(with: event, in: self.dropView)
         }
+        dropView.onEscape = { [weak self] in self?.dismissDropdown() }
+        dropView.onSearchText = { [weak self] q in self?.scheduleSearch(q) }
+        dropView.onPickRow = { [weak self] row in self?.open(row) }
         panel.contentView = dropView
+        panel.focusRoot = dropView
 
         // 还原位置，默认右下角
         let ud = UserDefaults.standard
@@ -3403,12 +4548,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             ? NSPoint(x: ud.double(forKey: Cfg.posXKey), y: ud.double(forKey: Cfg.posYKey))
             : NSPoint(x: screen.maxX - size.width - 32, y: screen.minY + 32)
         panel.setFrameOrigin(origin)
+        dockedOrigin = origin
         applyWindowLevel()
     }
 
-    private func setPanelVisible(_ v: Bool) {
+    // MARK: 形态与下拉
+
+    /// 迁移规则见方案 §3.3：新装默认下拉；存在任一旧键 → 老用户，保持常驻浮窗。
+    private func migratePanelMode() {
+        let ud = UserDefaults.standard
+        if let raw = ud.string(forKey: Cfg.modeKey), let m = PanelMode(rawValue: raw) {
+            panelMode = m
+            return
+        }
+        let isLegacy = Cfg.legacyKeys.contains { ud.object(forKey: $0) != nil }
+        panelMode = isLegacy ? .docked : .dropdown
+        ud.set(panelMode.rawValue, forKey: Cfg.modeKey)
+        DiagLog.write("面板模式：\(panelMode.rawValue)（\(isLegacy ? "老用户迁移" : "新装默认")）")
+    }
+
+    private func applyPanelModeAtLaunch() {
+        panel.mode = panelMode
+        switch panelMode {
+        case .docked:
+            let visible = UserDefaults.standard.object(forKey: Cfg.visibleKey) as? Bool ?? true
+            setPanelVisible(visible)
+        case .dropdown:
+            // 下拉模式不常驻：启动时面板是隐藏的，点图标才出来。
+            // 这里刻意**不写** visibleKey——临时可见不该变成下次启动的偏好。
+            setPanelVisible(false, record: false)
+        }
+        applyWindowLevel()
+        refreshMenuState()
+    }
+
+    private func setPanelVisible(_ v: Bool, record: Bool = true) {
         if v { panel.orderFrontRegardless() } else { panel.orderOut(nil) }
-        UserDefaults.standard.set(v, forKey: Cfg.visibleKey)
+        // 下拉形态的可见性永远是临时的：录音时临时显示面板不能变成
+        // 「下次以 docked 启动就把窗口摆出来」的偏好。
+        if record && panelMode == .docked {
+            UserDefaults.standard.set(v, forKey: Cfg.visibleKey)
+        }
     }
 
     @objc private func resetPosition() {
@@ -3416,17 +4596,156 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let s = panel.frame.size
         let p = NSPoint(x: screen.maxX - s.width - 32, y: screen.minY + 32)
         panel.setFrameOrigin(p)
+        dockedOrigin = p
         UserDefaults.standard.set(Double(p.x), forKey: Cfg.posXKey)
         UserDefaults.standard.set(Double(p.y), forKey: Cfg.posYKey)
         setPanelVisible(true)
     }
 
+    /// 左键统一入口：按模式分派（docked 显隐 / dropdown 展开收起）
     @objc private func togglePanel() {
-        setPanelVisible(!(panel.isVisible))
+        switch panelMode {
+        case .docked:
+            setPanelVisible(!panel.isVisible)
+        case .dropdown:
+            if panel.isVisible { dismissDropdown() } else { showDropdown(focusSearch: false) }
+        }
+        refreshMenuState()
+    }
+
+    @objc private func menuTogglePanel() {
+        if panelMode == .dropdown {
+            showDropdown(focusSearch: false)
+        } else {
+            togglePanel()
+        }
+    }
+
+    /// 状态栏按钮在屏幕上的矩形。**不能用 NSScreen.main**：
+    /// 副屏上点图标时 main 还是主屏，面板会飞到另一块屏幕上。
+    private func statusButtonScreenFrame() -> (anchor: NSRect?, screen: NSScreen?) {
+        guard let b = statusItem.button, let w = b.window else { return (nil, nil) }
+        let inWindow = b.convert(b.bounds, to: nil)
+        let onScreen = w.convertToScreen(inWindow)
+        return (onScreen, w.screen)
+    }
+
+    private func showDropdown(focusSearch: Bool) {
+        // 记录常驻位置：从 docked 拖到 dropdown 再回来时不能丢
+        if panelMode == .docked, panel.isVisible { dockedOrigin = panel.frame.origin }
+        panelMode = .dropdown
+        panel.mode = .dropdown
+
+        let (anchor, screen) = statusButtonScreenFrame()
+        let visible = screen?.visibleFrame
+            ?? NSScreen.main?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let size = PanelMetrics.dropdown
+        let frame = dropdownFrame(anchor: anchor, visible: visible, size: size)
+        panel.setFrame(frame, display: true)
+        dropView.setWide(true)
+        dropView.layoutSubtreeIfNeeded()
+        cancelSearch()
+        dropView.clearSearch()
+        dropView.setResults([], empty: "输入关键词，同时搜库内笔记与本机文件")
+
+        applyWindowLevel()
+        panel.orderFrontRegardless()
+        // 下拉要能接键盘（ESC / 搜索），但仍然不激活本 App
+        panel.makeKey()
+        if focusSearch { dropView.focusSearch() }
+        UserDefaults.standard.set(PanelMode.dropdown.rawValue, forKey: Cfg.modeKey)
+        DiagLog.write("下拉展开：anchor=\(anchor.map { NSStringFromRect($0) } ?? "nil") "
+                      + "frame=\(NSStringFromRect(frame))")
+        refreshMenuState()
+    }
+
+    /// 收起下拉。**模式保持不变**：点开又收起不等于「退回常驻浮窗」，
+    /// 否则用户第二次点图标会突然冒出一个小窗，与「点图标下拉」的预期不符。
+    /// 只在面板隐藏期间把 canBecomeKey 关掉，避免隐藏窗口抢键盘。
+    /// 点其他应用（或切到别的 Space）时收起。注释里一直写着要收起，
+    /// 但之前只实现了 Esc 与再点图标两条显式路径。
+    func applicationDidResignActive(_ notification: Notification) {
+        if panelMode == .dropdown, panel.isVisible { dismissDropdown() }
+    }
+
+    /// B6.3：点面板外立即收起。以前只有 Esc、再点图标、切 Space、App 失活四条路径，
+    /// 点桌面或同 App 的另一个窗口时下拉会一直挂着。
+    private func installOutsideClickMonitors() {
+        let masks: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown]
+        let check: () -> Void = { [weak self] in
+            guard let self, self.panelMode == .dropdown, self.panel.isVisible else { return }
+            let p = NSEvent.mouseLocation
+            if self.panel.frame.contains(p) { return }
+            // 点在状态栏按钮上时不收起：左键入口自己会 toggle，右键还要弹菜单。
+            if let r = self.statusItem.button?.window?.frame, r.contains(p) { return }
+            self.dismissDropdown()
+        }
+        if let g = NSEvent.addGlobalMonitorForEvents(matching: masks, handler: { _ in check() }) {
+            outsideClickMonitors.append(g)
+        }
+        if let l = NSEvent.addLocalMonitorForEvents(matching: masks, handler: { e in
+            check()
+            return e
+        }) {
+            outsideClickMonitors.append(l)
+        }
+    }
+
+    private func dismissDropdown() {
+        guard panelMode == .dropdown else { return }
+        panel.orderOut(nil)
+        panel.mode = .docked
+        cancelSearch()
+        dropView.clearSearch()
+        DiagLog.write("下拉收起（模式仍为 dropdown）")
+        refreshMenuState()
+    }
+
+    @objc private func togglePanelMode() {
+        if panelMode == .dropdown {
+            panel.orderOut(nil)
+            panelMode = .docked
+            panel.mode = .docked
+            panel.setContentSize(PanelMetrics.docked)
+            if let o = dockedOrigin { panel.setFrameOrigin(o) }
+            dropView.setWide(false)
+            cancelSearch()
+            dropView.clearSearch()
+            UserDefaults.standard.set(PanelMode.docked.rawValue, forKey: Cfg.modeKey)
+            applyWindowLevel()
+            setPanelVisible(true)
+        } else {
+            showDropdown(focusSearch: false)
+        }
+        refreshMenuState()
+    }
+
+    /// 屏幕变化后把面板夹回可见区域（P4）
+    private func clampPanelIntoScreen() {
+        guard panelMode == .docked, panel.isVisible else { return }
+        let screen = panel.screen ?? NSScreen.main
+        guard let v = screen?.visibleFrame else { return }
+        var f = panel.frame
+        f.origin.x = min(max(f.origin.x, v.minX + 8), max(v.maxX - f.width - 8, v.minX + 8))
+        f.origin.y = min(max(f.origin.y, v.minY + 8), max(v.maxY - f.height - 8, v.minY + 8))
+        if f.origin != panel.frame.origin {
+            panel.setFrameOrigin(f.origin)
+            dockedOrigin = f.origin
+            UserDefaults.standard.set(Double(f.origin.x), forKey: Cfg.posXKey)
+            UserDefaults.standard.set(Double(f.origin.y), forKey: Cfg.posYKey)
+            DiagLog.write("屏幕变化：面板已夹回可见区域 \(NSStringFromRect(f))")
+        }
     }
 
     // 窗口层级：floating（默认，悬浮在所有窗口之上）/ 底层（压在桌面之上、所有窗口之下）
     private func applyWindowLevel() {
+        // 下拉形态强制 floating：用户开着「置于底层」时，下拉面板会压在所有窗口
+        // 后面，等于点不出来。
+        if panelMode == .dropdown {
+            panel.level = .floating
+            return
+        }
         let bottom = UserDefaults.standard.bool(forKey: Cfg.bottomKey)
         panel.level = bottom
             ? NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopIconWindow)) + 1)
@@ -3466,6 +4785,100 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func openLog() {
         openLogFile()
+    }
+
+    // MARK: 搜索（1.4.0）
+
+    @objc private func menuSearch() {
+        showDropdown(focusSearch: true)
+    }
+
+    /// 输入即搜，但要防抖：中文输入法每敲一个拼音字母都会触发一次回调，
+    /// 不防抖就会把一个词拆成七八次索引查询。
+    ///
+    /// 序号在**文本一变**就推进，而不是等防抖定时器触发——否则新词已经显示在
+    /// 输入框里，上一次查询的结果还可能在这 120ms 内回填上来。
+    private func scheduleSearch(_ raw: String) {
+        searchDebounce?.invalidate()
+        searchDebounce = nil
+        searchSeq += 1
+        let seq = searchSeq
+        let q = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else {
+            dropView.setResults([], empty: "输入关键词，同时搜库内笔记与本机文件")
+            return
+        }
+        dropView.setSearching(true)
+        let t = Timer(timeInterval: 0.12, repeats: false) { [weak self] _ in
+            self?.runSearch(q, seq: seq)
+        }
+        RunLoop.main.add(t, forMode: .common)
+        searchDebounce = t
+    }
+
+    /// 收起面板 / 换形态 / 清空输入时统一取消：不然关闭期间仍会跑一次旧查询，
+    /// 重新打开时先闪一眼上次的结果。
+    private func cancelSearch() {
+        searchDebounce?.invalidate()
+        searchDebounce = nil
+        searchSeq += 1
+    }
+
+    private func runSearch(_ query: String, seq: Int) {
+        let vault = Cfg.vault
+        let t0 = Date()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let r = VaultIndex.blockingSearch(vault: vault, query: query, limit: 6)
+            let local = SpotlightSearch.search(query, limit: 3)
+            let ms = Int(Date().timeIntervalSince(t0) * 1000)
+
+            var rows: [SearchRow] = r.hits.map { h in
+                // 文件名当标题，正文首行当上下文：搜索结果里最有用的两样东西
+                let name = ((h.rel as NSString).lastPathComponent as NSString).deletingPathExtension
+                return SearchRow(kind: .vault, path: h.rel, title: name,
+                                 detail: h.snippet.isEmpty ? "第 \(h.line) 行" : h.snippet)
+            }
+            for l in local {
+                rows.append(SearchRow(kind: .local, path: l.path, title: l.name,
+                                      detail: l.path.replacingOccurrences(
+                                        of: NSHomeDirectory(), with: "~")))
+            }
+            let empty = rows.isEmpty ? "没有匹配「\(query)」的笔记，换个词试试" : ""
+            DiagLog.write("搜索「\(query)」：库内 \(r.hits.count) 条 / 库外 \(local.count) 条 / \(ms)ms")
+            MetricsStore.shared.record(MetricEvent(kind: "search", ok: !rows.isEmpty,
+                                                   target: "", noteRel: r.hits.first?.rel ?? "",
+                                                   source: "panel", durationMs: ms))
+            DispatchQueue.main.async {
+                guard let self, seq == self.searchSeq else { return }
+                self.dropView.setResults(rows, empty: empty)
+            }
+        }
+    }
+
+    /// 结果里按回车 / 点一行
+    private func open(_ row: SearchRow) {
+        switch row.kind {
+        case .vault:
+            openNote(rel: row.path)
+            MetricsStore.shared.record(MetricEvent(kind: "open", target: "", noteRel: row.path,
+                                                   source: "search"))
+        case .local:
+            NSWorkspace.shared.open(URL(fileURLWithPath: row.path))
+            MetricsStore.shared.record(MetricEvent(kind: "open", source: "search-local"))
+        }
+        if panelMode == .dropdown { dismissDropdown() }
+    }
+
+    // MARK: 看板与设置
+
+    @objc private func openDashboard() {
+        if dashboardWC == nil { dashboardWC = DashboardWindowController() }
+        dashboardWC?.show()
+    }
+
+    @objc private func openAISettings() {
+        if settingsWC == nil { settingsWC = AISettingsWindowController() }
+        settingsWC?.show()
     }
 
     @objc private func copyLogPath() {
@@ -3591,35 +5004,79 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
-        do {
-            let report = try Filer(vault: Cfg.vault).file([file], target: lastTarget)
-            try? FileManager.default.removeItem(at: file)
-            if let failure = report.failures.first {
-                dropView.flash("截图归档失败", ok: false)
-                let a = NSAlert()
-                a.messageText = "截图已生成，但归档失败"
-                a.informativeText = failure.reason
-                a.alertStyle = .warning
-                NSApp.activate(ignoringOtherApps: true)
-                a.runModal()
+        // 1.7.0：截图识别最多 12 秒，绝不能在主线程同步跑。
+        let target = lastTarget
+        let vault = Cfg.vault
+        let budget = AIBatchBudget(cap: AIConfigStore.config.effectiveBudget)
+        let ctx = ArchiveContext(source: "screenshot", scene: .image, target: target,
+                                 sourceURL: file, batchBudget: budget)
+        dropView.renderScene(.image)
+        dropView.renderAI(.working, phase: "识别图片", detail: "生成概览")
+        DispatchQueue.global(qos: .userInitiated).async {
+            let report: BatchReport
+            do {
+                report = try Filer(vault: vault).file([file], target: target, contexts: [ctx])
+            } catch {
+                // 归档抛错时保留临时 PNG：库里没有笔记，它是唯一副本。
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.dropView.renderAI(.failed, phase: "归档失败", detail: "")
+                    self.dropView.flash("归档失败", ok: false)
+                    let a = NSAlert()
+                    a.messageText = "截图已生成，但归档失败"
+                    a.informativeText = error.localizedDescription
+                        + "\n\n源图已保留：\(file.path)"
+                    a.alertStyle = .warning
+                    NSApp.activate(ignoringOtherApps: true)
+                    a.runModal()
+                }
                 return
             }
-            dropView.flash("截图已归档", ok: true)
-            if let first = report.outcomes.first {
-                NSLog("ObsidianDrop: 截图 → \(first.fileRel)")
-                if UserDefaults.standard.bool(forKey: "autoOpenNote") {
-                    openNote(rel: first.noteRel)
-                }
+            // 只有确认笔记落盘且零失败才删源图；失败分支由下面弹窗告知保留路径。
+            if ScreenshotCleanup.canDiscard(failures: report.failures.count,
+                                            noteRel: report.outcomes.first?.noteRel ?? "") {
+                try? FileManager.default.removeItem(at: file)
             }
-        } catch {
-            try? FileManager.default.removeItem(at: file)
-            dropView.flash("归档失败", ok: false)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.finishScreenshotReport(report, target: target, sourceFile: file)
+            }
+        }
+    }
+
+    private func finishScreenshotReport(_ report: BatchReport, target: String,
+                                        sourceFile: URL? = nil) {
+        let first = report.outcomes.first
+        MetricsStore.shared.record(MetricEvent(
+            kind: "screenshot", ok: report.failures.isEmpty, target: target,
+            noteRel: first?.noteRel ?? "", source: "panel",
+            captureId: first?.captureId ?? "",
+            failReason: report.failures.first?.reason ?? "",
+            ai: first?.aiState.rawValue ?? "off"))
+        if let o = first, !o.noteRel.isEmpty {
+            MetricNoteMap.remember(noteId: MetricID.hash(o.noteRel), rel: o.noteRel)
+        }
+        if let failure = report.failures.first {
+            dropView.renderAI(.failed, phase: "归档失败", detail: "")
+            dropView.flash("截图归档失败", ok: false)
             let a = NSAlert()
             a.messageText = "截图已生成，但归档失败"
-            a.informativeText = error.localizedDescription
+            a.informativeText = failure.reason
+                + (sourceFile.map { "\n\n源图已保留：\($0.path)" } ?? "")
             a.alertStyle = .warning
             NSApp.activate(ignoringOtherApps: true)
             a.runModal()
+            return
+        }
+        let skipped = first?.aiState == .skipped
+        dropView.renderAI(skipped ? .skipped : .done,
+                          phase: skipped ? "已归档（AI 跳过）" : "已归档", detail: "")
+        dropView.flash(skipped ? "截图已归档（AI 跳过）" : "截图已归档", ok: true)
+        if let first {
+            NSLog("ObsidianDrop: 截图 → \(first.fileRel)")
+            if UserDefaults.standard.bool(forKey: "autoOpenNote") {
+                openNote(rel: first.noteRel)
+            }
         }
     }
 
@@ -3735,7 +5192,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                         audioPath: "",
                                         source: "file",
                                         createdAt: Date(),
-                                        attempts: 0)
+                                        attempts: 0,
+                                        aiState: AIConfigStore.config.enabled ? .pending : nil)
                     if (try? PendingStore.enqueue(m)) != nil {
                         pendingID = m.id
                         DiagLog.round(run, "结果已落盘：\(m.id)（\(m.text.count) 字）→ 待归档队列")
@@ -3942,23 +5400,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let queued = PendingStore.count
         DiagLog.round(memoRunID, "看门狗：\(Int(silent)) 秒无事件（阶段 \(stuckStage)），强制恢复界面。"
                       + "待归档 \(queued) 条。日志：\(DiagLog.path)")
-        // 恢复界面只是「让人能继续操作」，不是「这一轮作废」。
-        // 队列里有文字就先补写——这是 1.3.13 完全缺失的一步：
-        // 那时结果被丢弃后既没归档也没人管，用户等 2.5 分钟只等到一句「卡住了」。
-        var drained = (ok: 0, failed: 0)
-        if queued > 0 {
-            drained = MemoArchiveQueue.drain()
-            DiagLog.round(memoRunID, "看门狗：补归档成功 \(drained.ok) 条，失败 \(drained.failed) 条")
-        }
+        // 界面先恢复：这一步不依赖磁盘 IO，不能等补归档。
         memoState = .idle
         memoSession = nil
         stopMemoTimer()
         stopWatchdog()
         lastPartial = ""
         dropView.renderMemo(.idle, partial: "")
-        dropView.flash(drained.ok > 0 ? "文字已归档，界面已恢复" : "转写卡住了，已恢复", ok: drained.ok > 0)
         rebuildMenu()
 
+        // P7：补归档要做「读 pending → 可能跑 AI → 写笔记」，
+        // 原来整段在主线程执行，正好在最需要界面活着的时候把主线程堵住
+        // （表现为恢复界面后仍转圈、菜单点不动）。改为后台执行，完成后回主线程收尾。
+        let finish: ((ok: Int, failed: Int)) -> Void = { [weak self] drained in
+            guard let self else { return }
+            DiagLog.round(self.memoRunID, "看门狗：补归档成功 \(drained.ok) 条，失败 \(drained.failed) 条")
+            self.dropView.flash(drained.ok > 0 ? "文字已归档，界面已恢复" : "转写卡住了，已恢复",
+                                ok: drained.ok > 0)
+            self.afterStallRecovery(drained: drained, stuckStage: stuckStage, silent: silent)
+        }
+        if queued > 0 {
+            DispatchQueue.global(qos: .utility).async {
+                let d = MemoArchiveQueue.drain()
+                DispatchQueue.main.async { finish(d) }
+            }
+        } else {
+            finish((ok: 0, failed: 0))
+        }
+    }
+
+    /// 恢复界面之后的两种收尾：自动验收直接退出码，正常模式给一个能看懂的弹窗
+    private func afterStallRecovery(drained: (ok: Int, failed: Int),
+                                    stuckStage: String, silent: Double) {
         // 自动验收模式下没人点弹窗，直接给结论并退出。
         // 若这次是在验证「结果延后到达」，「延后到达」本身就是预期，不能在这里退出。
         if AutoUI.memoFile != nil {
@@ -4066,9 +5539,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // 投放
     private func handleDrop(_ urls: [URL]) {
-        let filer = Filer(vault: Cfg.vault)
-        do {
-            let report = try filer.file(urls, target: lastTarget)
+        // 1.7.0：取文 / 压缩 / AI / 附件复制全部移出主线程，12 秒预算也不该卡住菜单栏。
+        let target = lastTarget
+        let vault = Cfg.vault
+        dropView.renderDropActivity(true)
+        DispatchQueue.global(qos: .userInitiated).async {
+            // A7.4：SceneRouter.classify 会读文件属性（网络盘/坏挂载可能很慢），
+            // 整批分类必须和 Filer 一起待在后台，不能卡菜单栏。
+            let batch = AIBatchBudget(cap: AIConfigStore.config.effectiveBudget)
+            let contexts = urls.map {
+                ArchiveContext(source: "drop", scene: SceneRouter.classify(file: $0),
+                               target: target, sourceURL: $0, batchBudget: batch)
+            }
+            let report: BatchReport
+            do {
+                report = try Filer(vault: vault).file(urls, target: target, contexts: contexts)
+            } catch {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.dropView.renderDropActivity(false)
+                    self.failArchive(error)
+                }
+                return
+            }
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.dropView.renderDropActivity(false)
+                self.finishDrop(report, target: target, contexts: contexts)
+            }
+        }
+    }
+
+    private func failArchive(_ error: Error) {
+        dropView.flash("失败", ok: false)
+        let a = NSAlert()
+        a.messageText = "归档失败"
+        a.informativeText = error.localizedDescription
+        a.alertStyle = .warning
+        NSApp.activate(ignoringOtherApps: true)
+        a.runModal()
+    }
+
+    private func finishDrop(_ report: BatchReport, target: String,
+                            contexts: [ArchiveContext]) {
+        let lastTarget = target
+            // 逐文件埋点。以前一批只记一条 + count 加权，导致「成功率」按事件算、
+            // 「总数」按文件算——部分失败的一批会既夸大失败又低估成功。
+            // 只记「投了几次、成没成、到哪个目标（哈希）」，文件名与内容都不落。
+            for o in report.outcomes {
+                let ev = MetricEvent(kind: "drop", ok: true, target: lastTarget,
+                                     noteRel: o.noteRel, source: "panel",
+                                     captureId: o.captureId, ai: o.aiState.rawValue)
+                MetricsStore.shared.record(ev)
+                if !o.noteRel.isEmpty {
+                    MetricNoteMap.remember(noteId: ev.noteId, rel: o.noteRel)
+                }
+            }
+            for f in report.failures {
+                let cap = contexts.first(where: { $0.sourceURL?.path == f.source })?.captureId
+                    ?? UUID().uuidString
+                MetricsStore.shared.record(MetricEvent(
+                    kind: "drop", ok: false, target: lastTarget, source: "panel",
+                    captureId: cap, failReason: f.reason))
+            }
             if report.outcomes.isEmpty {
                 // 全部失败：直接给出第一条原因，避免只闪一下「失败」
                 let reason = report.failures.first?.reason ?? "未知原因"
@@ -4092,22 +5625,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 NSApp.activate(ignoringOtherApps: true)
                 a.runModal()
             } else {
+                let skipped = report.outcomes.filter { $0.aiState == .skipped }.count
                 let msg = report.outcomes.count == 1 ? "已归档 1 个" : "已归档 \(report.outcomes.count) 个"
-                dropView.flash(msg, ok: true)
+                // AI 跳过但笔记写成功，绝不能报「归档失败」
+                dropView.flash(skipped > 0 ? msg + "（AI 跳过）" : msg, ok: true)
             }
+            dropView.renderBatch(success: report.outcomes.count,
+                                 failed: report.failures.count)
             NSLog("ObsidianDrop: \(report.outcomes.map { $0.fileRel }.joined(separator: ", "))")
             if UserDefaults.standard.bool(forKey: "autoOpenNote"), let first = report.outcomes.first {
                 openNote(rel: first.noteRel)
             }
-        } catch {
-            dropView.flash("失败", ok: false)
-            let a = NSAlert()
-            a.messageText = "归档失败"
-            a.informativeText = error.localizedDescription
-            a.alertStyle = .warning
-            NSApp.activate(ignoringOtherApps: true)
-            a.runModal()
-        }
     }
 }
 
@@ -4396,6 +5924,9 @@ extension AppDelegate: MemoSink {
             } catch {
                 DiagLog.round(run, "归档失败：\(String(format: "%.2f", Date().timeIntervalSince(archiveStart)))s ｜ \(error.localizedDescription)"
                               + "（文字仍在待归档队列 \(item.id)，录音保留）")
+                MetricsStore.shared.record(MetricEvent(
+                    kind: "memo", ok: false, target: item.target, source: "ui",
+                    failReason: error.localizedDescription, ai: item.ai.rawValue))
                 await MainActor.run {
                     guard let self else { return }
                     guard run == self.memoRunID else { return }
@@ -4981,6 +6512,504 @@ enum SelfTest {
             }
         }
 
+        // ===== 1.3.16 下拉定位（纯函数，不建窗口）=====
+        do {
+            let vis = NSRect(x: 0, y: 0, width: 1440, height: 860)
+            let size = PanelMetrics.dropdown
+            let anchor = NSRect(x: 1200, y: 878, width: 24, height: 24)
+            let f = dropdownFrame(anchor: anchor, visible: vis, size: size)
+            check("下拉贴顶", abs(f.maxY - vis.maxY) < 1, NSStringFromRect(f))
+            check("下拉不越右边界", f.maxX <= vis.maxX - 8, NSStringFromRect(f))
+            check("下拉尺寸等于 PanelMetrics.dropdown",
+                  f.width == PanelMetrics.dropdown.width && f.height == PanelMetrics.dropdown.height,
+                  "\(f.size)")
+
+            let negVis = NSRect(x: -1920, y: 0, width: 1920, height: 1055)
+            let negAnchor = NSRect(x: -1900, y: 1078, width: 24, height: 24)
+            let nf = dropdownFrame(anchor: negAnchor, visible: negVis, size: size)
+            check("副屏负坐标仍在屏内", nf.minX >= negVis.minX && nf.maxX <= negVis.maxX,
+                  NSStringFromRect(nf))
+
+            let narrow = NSRect(x: 0, y: 0, width: 300, height: 700)
+            let wf = dropdownFrame(anchor: NSRect(x: 250, y: 720, width: 24, height: 24),
+                                   visible: narrow, size: size)
+            check("窄屏裁宽度", wf.width <= narrow.width - 16, "\(wf.width)")
+
+            let short = NSRect(x: 0, y: 0, width: 1440, height: 200)
+            let hf = dropdownFrame(anchor: NSRect(x: 700, y: 220, width: 24, height: 24),
+                                   visible: short, size: size)
+            check("矮屏裁高度", hf.height <= short.height - 16 && hf.maxY <= short.maxY,
+                  NSStringFromRect(hf))
+
+            let nilF = dropdownFrame(anchor: nil, visible: vis, size: size)
+            check("无锚点时顶部居中", abs(nilF.midX - vis.midX) < 1 && abs(nilF.maxY - vis.maxY) < 1,
+                  NSStringFromRect(nilF))
+        }
+
+        // ===== 1.4.0 搜索 =====
+        do {
+            let sv = root.appendingPathComponent("searchvault")
+            try? fm.createDirectory(at: sv.appendingPathComponent("30-资源"),
+                                    withIntermediateDirectories: true)
+            try? fm.createDirectory(at: sv.appendingPathComponent("10-项目/强强"),
+                                    withIntermediateDirectories: true)
+            try? fm.createDirectory(at: sv.appendingPathComponent(".obsidian"),
+                                    withIntermediateDirectories: true)
+            try? "# 预焙阳极工艺参数\n煅烧温度 1250℃，成型压力 160MPa"
+                .write(to: sv.appendingPathComponent("30-资源/预焙阳极工艺参数.md"),
+                       atomically: true, encoding: .utf8)
+            try? "# 评审记录\n预焙阳极车间数据采集频次需与 MES 对齐\n煅烧曲线要留存"
+                .write(to: sv.appendingPathComponent("10-项目/强强/评审记录.md"),
+                       atomically: true, encoding: .utf8)
+            try? "# 无关笔记\n今天买了两斤苹果"
+                .write(to: sv.appendingPathComponent("30-资源/杂物.md"),
+                       atomically: true, encoding: .utf8)
+            try? "// should be skipped"
+                .write(to: sv.appendingPathComponent(".obsidian/workspace.md"),
+                       atomically: true, encoding: .utf8)
+
+            let docs = VaultIndexer.scan(vault: sv)
+            check("索引只收库内 md", docs.count == 3, "\(docs.count)")
+            check("索引跳过 .obsidian", !docs.contains { $0.rel.contains(".obsidian") })
+
+            let hits = VaultSearch.search(docs, query: "预焙阳极", limit: 10)
+            check("正文命中能搜到", hits.count == 2, "\(hits.count)")
+            check("文件名命中排前", hits.first?.rel.contains("预焙阳极工艺参数") == true,
+                  hits.first?.rel ?? "-")
+            check("命中带行号与片段", (hits.first?.line ?? 0) >= 1 && !(hits.first?.snippet.isEmpty ?? true),
+                  "\(hits.first?.line ?? -1)")
+
+            let andHits = VaultSearch.search(docs, query: "煅烧 压力", limit: 10)
+            check("多词走 AND", andHits.count == 1, "\(andHits.count)")
+            check("无命中返回空", VaultSearch.search(docs, query: "zzz不存在", limit: 10).isEmpty)
+            check("空查询返回空", VaultSearch.search(docs, query: "   ", limit: 10).isEmpty)
+        }
+
+        // ===== 1.4.1 看板口径 =====
+        do {
+            let now = Date()
+            func ev(_ kind: String, _ ok: Bool, _ daysAgo: Double, ms: Int = 100,
+                    ai: String = "off") -> MetricEvent {
+                MetricEvent(kind: kind, ok: ok, target: "00-收件箱", noteRel: "30-资源/a.md",
+                            source: "selftest", durationMs: ms, ai: ai,
+                            at: now.addingTimeInterval(-daysAgo * 86400))
+            }
+            let events = [ev("drop", true, 0), ev("drop", false, 0), ev("memo", true, 1),
+                          ev("search", true, 0), ev("open", true, 0)]
+            let s = MetricsQuery.summary(events: events, now: now, days: 7)
+            check("成功率只算投递类", abs(s.successRate - 2.0 / 3.0) < 0.001, "\(s.successRate)")
+            check("搜索不计入成功率分母", s.ok + s.failed == 3, "\(s.ok + s.failed)")
+            check("打开率按成功投递算", abs(s.openRate - 0.5) < 0.001, "\(s.openRate)")
+            check("7 天补齐空白日", s.daily.count == 7, "\(s.daily.count)")
+            check("样本不足不给 p95", s.p95Ms == nil)
+            check("目标按哈希聚合", s.byTarget.first?.count == 3, "\(s.byTarget.count)")
+            check("哈希只有 8 位且不含明文", s.byTarget.first?.id.count == 8
+                  && s.byTarget.first?.id != "00-收件箱", s.byTarget.first?.id ?? "-")
+
+            let many = (0..<40).map { ev("drop", true, 0, ms: 100 + $0) }
+            let s2 = MetricsQuery.summary(events: many, now: now, days: 7)
+            check("样本够时给 p95", s2.p95Ms != nil, "\(s2.p95Ms ?? -1)")
+            check("p95 不小于中位数", (s2.p95Ms ?? 0) >= MetricsQuery.percentile((100..<140).map { $0 }, 0.5))
+
+            // 同一次投递会写两条事件（ai + 投递）。两条都算就翻倍，
+            // 看板上「AI 完成 2」实际只处理了 1 次——这个口径错得很隐蔽。
+            let cap = "same-capture"
+            let dup = [
+                MetricEvent(kind: "ai", ok: true, target: "00-收件箱", source: "archive",
+                            captureId: cap, ai: "done"),
+                MetricEvent(kind: "memo", ok: true, target: "00-收件箱", noteRel: "a.md",
+                            source: "archive", captureId: cap, ai: "done"),
+            ]
+            let s3 = MetricsQuery.summary(events: dup, now: now, days: 7)
+            check("AI 同一次投递只计一次", s3.aiDone == 1, "\(s3.aiDone)")
+            check("AI 同一次投递也不误记跳过", s3.aiSkipped == 0 && s3.aiOff == 0,
+                  "\(s3.aiSkipped)/\(s3.aiOff)")
+
+            // 打开率问的是「多少产出被看过」，同一篇点三次不能算三次
+            let opens = [
+                MetricEvent(kind: "memo", ok: true, noteRel: "a.md", source: "archive"),
+                MetricEvent(kind: "open", noteRel: "a.md", source: "dashboard"),
+                MetricEvent(kind: "open", noteRel: "a.md", source: "dashboard"),
+                MetricEvent(kind: "open", noteRel: "b.md", source: "search-local"),
+            ]
+            let s4 = MetricsQuery.summary(events: opens, now: now, days: 7)
+            check("同一篇打开多次只算一次", s4.opened == 2, "\(s4.opened)")
+            check("打开率不超过 100%", s4.openRate <= 1.0, "\(s4.openRate)")
+
+            // 跨夏令时的日子不能丢：按 Calendar 递推而不是减 86400 秒。
+            // 2026-03-08 美东夏令时开始，那天只有 23 小时；从 3/9 00:30 往回退
+            // 86400 秒会直接落到 3/7，3/8 整段消失（旧算法在这里只出 6 个日期）。
+            var cals = Calendar(identifier: .gregorian)
+            cals.timeZone = TimeZone(identifier: "America/New_York") ?? .current
+            let dstNow = cals.date(from: DateComponents(year: 2026, month: 3, day: 9,
+                                                        hour: 0, minute: 30)) ?? now
+            let dstEvent = MetricEvent(kind: "drop", ok: true, target: "00-收件箱",
+                                       at: cals.date(from: DateComponents(year: 2026, month: 3,
+                                                                         day: 8, hour: 12)) ?? dstNow)
+            let s5 = MetricsQuery.summary(events: [dstEvent], now: dstNow, days: 7,
+                                          calendar: cals)
+            check("跨夏令时 7 天不重不漏", Set(s5.daily.map { $0.label }).count == 7,
+                  "\(s5.daily.map { $0.label }.joined(separator: ","))")
+            check("夏令时当天的事件落在当天",
+                  s5.daily.first { $0.label == "03-08" }?.total == 1,
+                  "03-08=\(s5.daily.first { $0.label == "03-08" }?.total ?? -1)")
+        }
+
+        // ===== 归档完成标记（P1-9）：删 pending 前崩溃不写第二篇 =====
+        do {
+            let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+                .appendingPathComponent("od-marker-\(UUID().uuidString)")
+            let old = PendingStore.overrideDirectory
+            PendingStore.overrideDirectory = dir
+            defer {
+                PendingStore.overrideDirectory = old
+                try? FileManager.default.removeItem(at: dir)
+            }
+            let id = UUID().uuidString
+            ArchiveMarker.mark(id: id, rel: "00-收件箱/2026-01-01 灵感.md")
+            check("完成标记能读回", ArchiveMarker.doneRel(id: id) == "00-收件箱/2026-01-01 灵感.md",
+                  ArchiveMarker.doneRel(id: id) ?? "-")
+            ArchiveMarker.clear(id: id)
+            check("清掉后标记不再存在", ArchiveMarker.doneRel(id: id) == nil)
+
+            // 有标记 + pending 还在 = 上次写完没来得及删 → 只清理，不再写笔记
+            let vm = PendingMemo(id: id, text: "已经写过一次的内容", duration: 3,
+                                 target: "00-收件箱", vaultPath: dir.path,
+                                 engine: "test", audioPath: "", source: "record",
+                                 createdAt: Date(), attempts: 0)
+            try? PendingStore.enqueue(vm)
+            ArchiveMarker.mark(id: id, rel: "00-收件箱/已存在.md")
+            let again: DropOutcome? = (try? MemoArchiveQueue.archive(vm)) ?? nil
+            check("有完成标记时不再写第二篇", again == nil)
+            check("同时把残留 pending 清掉", PendingStore.count == 0, "\(PendingStore.count)")
+            check("清理后标记也一并删除", ArchiveMarker.doneRel(id: id) == nil)
+
+            // 最后一段窗口：笔记写完、标记还没落盘。这一段只能靠正文查重兜住。
+            let vault = dir.appendingPathComponent("vault")
+            try? FileManager.default.createDirectory(
+                at: vault.appendingPathComponent("00-收件箱"), withIntermediateDirectories: true)
+            let text = "崩溃前已经写进笔记的一段文字，长度足够触发查重，不会被当成太短。"
+            let note = vault.appendingPathComponent("00-收件箱/2026-01-01 灵感.md")
+            try? ("---\n类型: 灵感速记\n---\n\n" + text)
+                .write(to: note, atomically: true, encoding: .utf8)
+            let past = Date().addingTimeInterval(-180)
+            check("恢复时按正文认出已经写过",
+                  RecoveryDedupe.existingNote(vault: vault, text: text, createdAt: past) != nil)
+            check("刚创建的 pending 不走查重",
+                  RecoveryDedupe.existingNote(vault: vault, text: text, createdAt: Date()) == nil)
+            check("太短的文字不做查重",
+                  RecoveryDedupe.existingNote(vault: vault, text: "收到", createdAt: past) == nil)
+            check("正文没出现在库里就不算写过",
+                  RecoveryDedupe.existingNote(vault: vault,
+                                              text: "这段话从来没有被写进任何笔记，属于新内容。",
+                                              createdAt: past) == nil)
+        }
+
+        // ===== 1.5.0 AI 配置与解析 =====
+        do {
+            check("接受 https 并去尾斜杠",
+                  (try? AIConfig.normalize(base: "https://api.openai.com/v1/")) == "https://api.openai.com/v1")
+            check("拒绝带 query 的地址", (try? AIConfig.normalize(base: "https://x.com/v1?a=1")) == nil)
+            check("拒绝外网 http", (try? AIConfig.normalize(base: "http://example.com/v1")) == nil)
+            check("允许本机 http", (try? AIConfig.normalize(base: "http://127.0.0.1:11434/v1")) != nil)
+            check("拒绝带用户名的地址", (try? AIConfig.normalize(base: "https://u:p@x.com/v1")) == nil)
+
+            let raw = "好的：\n```json\n{\"title\":\"煅烧温度记录\",\"summary\":\"记录三段温度\",\"tags\":[\"#工艺\",\"工艺\",\"MES\"]}\n```"
+            let r = try? AIService.parseResult(raw, model: "m", ms: 12)
+            check("能剥掉代码块解析", r?.title == "煅烧温度记录", r?.title ?? "nil")
+            check("标签去重且去 #", r?.tags == ["工艺", "MES"], "\(r?.tags ?? [])")
+
+            let long = String(repeating: "字", count: 200)
+            let r2 = try? AIService.parseResult("{\"title\":\"\(long)\",\"summary\":\"\(long)\",\"tags\":[]}",
+                                                model: "m", ms: 1)
+            check("标题摘要超长被截断", (r2?.title.count ?? 0) <= 40 && (r2?.summary.count ?? 0) <= 160)
+
+            var off = AIConfig()
+            off.enabled = false
+            let (st, _, _) = AIService.decorate(text: "x", target: "00-收件箱", config: off)
+            check("未启用时状态为 off", st == .off, st.rawValue)
+
+            let json = """
+            {"id":"x","text":"t","duration":1,"target":"00-收件箱","vaultPath":"/tmp/v",\
+            "engine":"e","audioPath":"","source":"record","createdAt":"2026-11-05T00:00:00Z","attempts":0}
+            """
+            let dec = JSONDecoder()
+            dec.dateDecodingStrategy = .iso8601
+            let old = try? dec.decode(PendingMemo.self, from: Data(json.utf8))
+            check("旧 pending 无 aiState 也能解码", old != nil && old?.ai == .off)
+            check("旧 pending 的 scene 解释为 transcript", old?.scene == .transcript)
+        }
+
+        // ===== 1.7.0 三场景 / 独占发布 / 新布局 =====
+        do {
+            let t = URL(fileURLWithPath: NSTemporaryDirectory())
+                .appendingPathComponent("od-170-selftest-\(UUID().uuidString)", isDirectory: true)
+            try? FileManager.default.createDirectory(at: t, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: t) }
+
+            func touch(_ name: String, _ s: String = "预焙阳极焙烧曲线记录，煅烧温度与成型压力的对应关系。") -> URL {
+                let u = t.appendingPathComponent(name)
+                try? s.write(to: u, atomically: true, encoding: .utf8)
+                return u
+            }
+            func png(_ name: String, w: Int, h: Int) -> URL? {
+                let img = NSImage(size: NSSize(width: w, height: h))
+                img.lockFocus()
+                NSColor.systemBlue.setFill()
+                NSRect(x: 0, y: 0, width: w, height: h).fill()
+                img.unlockFocus()
+                guard let tiff = img.tiffRepresentation,
+                      let rep = NSBitmapImageRep(data: tiff),
+                      let d = rep.representation(using: .png, properties: [:]) else { return nil }
+                let u = t.appendingPathComponent(name)
+                try? d.write(to: u)
+                return u
+            }
+
+            let md = touch("周会记录.md"), txt = touch("note.txt"), csv = touch("data.csv")
+            let zip = touch("bundle.zip"), svg = touch("icon.svg"), mp4 = touch("clip.mp4")
+            let shot = png("shot.png", w: 2400, h: 1200)
+            check("md/txt/csv 归 document",
+                  [md, txt, csv].allSatisfy { SceneRouter.classify(file: $0) == .document })
+            check("png 归 image", shot.map { SceneRouter.classify(file: $0) == .image } ?? false)
+            check("截图来源的 PNG 仍是 image",
+                  shot.map { SceneRouter.classify(file: $0, origin: "screenshot") == .image } ?? false)
+            let noExt = t.appendingPathComponent("shot-noext")
+            if let shot, let d = try? Data(contentsOf: shot) { try? d.write(to: noExt) }
+            check("无扩展名截图用 ImageIO 首帧判为 image（不靠后缀）",
+                  SceneRouter.classify(file: noExt, origin: "screenshot") == .image
+                    && SceneRouter.classify(file: noExt, origin: "drop") == .legacy)
+            check("svg/zip/mp4/未知类型归 legacy",
+                  [zip, svg, mp4, touch("noext")].allSatisfy {
+                      SceneRouter.classify(file: $0) == .legacy
+                  })
+            let dir = t.appendingPathComponent("文件夹", isDirectory: true)
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            check("文件夹归 legacy", SceneRouter.classify(file: dir) == .legacy)
+            check("pending 转写优先于扩展名",
+                  SceneRouter.classify(file: zip, origin: "record") == .transcript)
+
+            let big = touch("big.txt", String(repeating: "字", count: 11 * 1024 * 1024 / 3 + 1))
+            check("超过 10MiB 的文本归 legacy",
+                  SceneRouter.classify(file: big) == .legacy)
+            check("假 PDF 无文字层时回落 legacy",
+                  SceneRouter.resolve(file: touch("fake.pdf", "not a pdf"), origin: "drop") == .legacy)
+
+            if let shot {
+                let enc = try? ImagePayload.encode(shot)
+                check("图片缩到 2048 且是 JPEG data URI",
+                      enc?.dataURI.hasPrefix("data:image/jpeg;base64,") == true
+                        && max(enc?.width ?? 9999, enc?.height ?? 9999) <= 2048,
+                      "\(enc?.width ?? 0)×\(enc?.height ?? 0)")
+                let prepared = SceneMaterial.prepare(url: shot, origin: "screenshot",
+                                                     target: "00-收件箱")
+                check("截图材料准备为 image", prepared.scene == .image)
+                if let input = prepared.input,
+                   let body = AISceneService.requestBody(input: input, config: AIConfig()),
+                   let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+                   let msgs = obj["messages"] as? [[String: Any]],
+                   let user = msgs.last?["content"] as? [[String: Any]] {
+                    check("视觉请求含 text + image_url 两部分", user.count == 2)
+                    let iu = user.last?["image_url"] as? [String: Any]
+                    check("视觉请求 detail=high 且模型用视觉模型",
+                          iu?["detail"] as? String == "high"
+                            && obj["model"] as? String == AIConfig().effectiveVisionModel)
+                } else { check("视觉请求体可解析", false) }
+            }
+
+            check("转录提示词保留原文三条要求",
+                  AIPrompts.transcript.contains("保留原文的全部信息")
+                    && AIPrompts.transcript.contains("拿不准时保持原文")
+                    && AIPrompts.transcript.contains("不补充原文没有的"))
+            let input = AISceneInput.transcript(text: "今天部署测试环境，访问 https://example.com/a 后验证 12345",
+                                                target: "00-收件箱", engine: "cli", duration: 3)
+            let bad = "{\"title\":\"测试\",\"summary\":\"概要\",\"tags\":[],\"polishedText\":\"太短\",\"edits\":[]}"
+            check("润色稿过短被拒绝",
+                  (try? AISceneService.parse(bad, input: input, model: "m", ms: 1)) == nil)
+            let noURL = "{\"title\":\"测试\",\"summary\":\"概要\",\"tags\":[],\"polishedText\":\""
+                + "今天部署测试环境，访问后验证 12345，一切正常，稍后再看看日志和告警面板。" + "\",\"edits\":[]}"
+            check("润色稿丢失 URL 被拒绝",
+                  (try? AISceneService.parse(noURL, input: input, model: "m", ms: 1)) == nil)
+            check("关键项提取含 URL 与连续数字",
+                  AISceneService.keyTokens("见 https://x.com/a 编号 12345").count >= 2)
+
+            let u1 = try? ExclusiveNoteWriter.publish(text: "第一篇", dir: t, base: "同名")
+            let u2 = try? ExclusiveNoteWriter.publish(text: "第二篇", dir: t, base: "同名")
+            let s1 = u1.flatMap { try? String(contentsOf: $0, encoding: .utf8) }
+            check("同名连写生成 -2 且不覆盖", u1?.lastPathComponent == "同名.md"
+                    && u2?.lastPathComponent == "同名-2.md" && s1 == "第一篇",
+                  "\(u1?.lastPathComponent ?? "-") / \(u2?.lastPathComponent ?? "-")")
+
+            let spent = AIBatchBudget(now: Date().addingTimeInterval(-20))
+            check("预算耗尽后不再请求", spent.attemptBudget(pending: 1) == nil)
+            let fresh = AIBatchBudget(now: Date())
+            check("预算按剩余项分摊且不超过 12s",
+                  (fresh.attemptBudget(pending: 3) ?? 99) <= 12)
+
+            let f = PanelLayout.frames(NSRect(x: 0, y: 0, width: 400, height: 520))
+            check("头部表面 (12,396,376,108)",
+                  f.surface.origin.x == 12 && f.surface.origin.y == 396
+                    && f.surface.width == 376 && f.surface.height == 108)
+            check("搜索框 (16,344,368,32)",
+                  f.search.origin.x == 16 && f.search.origin.y == 344
+                    && f.search.width == 368 && f.search.height == 32)
+            check("结果区 (16,60,368,234) 且 5 行",
+                  f.results.origin.y == 60 && f.results.width == 368
+                    && f.results.height == 234 && f.visibleRows == 5)
+            check("底栏 (12,12,376,36) 与打开按钮 104×28",
+                  f.footer.origin.y == 12 && f.footer.width == 376
+                    && f.footer.height == 36 && f.open.width == 104 && f.open.height == 28)
+            check("截屏/灵感按钮 76×30 / 72×30 且底边 406",
+                  f.shot.width == 76 && f.shot.height == 30
+                    && f.memo.width == 72 && f.memo.height == 30
+                    && f.shot.origin.y == 406 && f.memo.origin.y == 406)
+            check("B2 按钮 x：截屏 224 / 灵感 308 / 快捷键 248",
+                  f.shot.origin.x == 224 && f.memo.origin.x == 308
+                    && f.shortcut.origin.x + f.footer.origin.x == 248)
+            let ddView = DropView(frame: NSRect(x: 0, y: 0, width: 400, height: 520))
+            ddView.layoutSubtreeIfNeeded()
+            check("B6.2 下拉焦点链 5 项且首项是搜索框",
+                  ddView.focusChain().count == 5
+                    && ddView.focusChain().first is NSSearchField)
+            let dkView = DropView(frame: NSRect(x: 0, y: 0,
+                                                width: PanelMetrics.docked.width,
+                                                height: PanelMetrics.docked.height))
+            dkView.layoutSubtreeIfNeeded()
+            check("B6.2 docked 不建焦点链（保持 1.6.0 键盘行为）",
+                  dkView.focusChain().isEmpty)
+            check("B6.2 截屏/灵感按钮能真正接受键盘焦点",
+                  ddView.focusChain().dropFirst(2).prefix(2)
+                    .allSatisfy { $0.acceptsFirstResponder })
+
+            // 重新检查修补①：截图临时源图必须等确认笔记落盘才删。
+            check("截图归档失败时必须保留源图",
+                  !ScreenshotCleanup.canDiscard(failures: 1, noteRel: "")
+                    && !ScreenshotCleanup.canDiscard(failures: 0, noteRel: ""))
+            check("截图零失败且产出笔记才允许删源图",
+                  ScreenshotCleanup.canDiscard(failures: 0, noteRel: "00-收件箱/x.md"))
+
+            // 重新检查修补②：恢复查重不再只用前 60 字前缀判重。
+            let samePrefix = String(repeating: "嗯那个今天我们讨论一下预焙阳极的焙烧曲线和成型工序，", count: 3)
+            let firstMemo = samePrefix + "第一段录音的独有结论：温度控制在一千二百度。"
+            let secondMemo = samePrefix + "第二段录音的独有结论：需要复核焙烧曲线并调整风量。"
+            do {
+                try firstMemo.write(to: vault.appendingPathComponent("已归档笔记.md"),
+                                    atomically: true, encoding: .utf8)
+                let old = Date().addingTimeInterval(-120)
+                check("恢复查重不再按前 60 字误删不同录音",
+                      RecoveryDedupe.existingNote(vault: vault, text: secondMemo,
+                                                  createdAt: old) == nil)
+                check("恢复查重仍能识别整段原文已入库",
+                      RecoveryDedupe.existingNote(vault: vault, text: firstMemo,
+                                                  createdAt: old) != nil)
+            } catch {
+                check("恢复查重测试夹具可写", false)
+            }
+
+            // 重新检查修补③：润色稿不能悄悄换掉金额、编号、星期。
+            var rejectedBadPolish = false
+            do {
+                try AISceneService.validatePolish(
+                    original: "张三负责上海项目，预算200元，周五交付。",
+                    polished: "李四负责北京项目，预算900元，周一交付。")
+            } catch { rejectedBadPolish = true }
+            check("润色稿改写金额/星期必须被拒绝", rejectedBadPolish)
+            var acceptedNormalPolish = true
+            do {
+                try AISceneService.validatePolish(
+                    original: "嗯那个今天部署一下测试环境，访问 https://example.com/a 之后验证一下 12345。一切正常。",
+                    polished: "今天部署测试环境，访问 https://example.com/a 后验证 12345。一切正常。")
+            } catch { acceptedNormalPolish = false }
+            check("只去口头禅、保留关键项的润色仍允许", acceptedNormalPolish)
+
+            // 第二轮复核：--target 是 1.6.0 旧用法共用的参数，不能算「场景标志」。
+            check("1.6.0 旧 --ai-run <文字> 仍走 AICLI",
+                  SceneCLI.isLegacyAIUsage(["--ai-run", "一段文字"]))
+            check("旧用法带 --target 仍走 AICLI（--target 不是场景标志）",
+                  SceneCLI.isLegacyAIUsage(["--ai-run", "一段文字",
+                                            "--target", "00-收件箱"]))
+            check("出现任一 1.7.0 标志才走场景 CLI",
+                  !SceneCLI.isLegacyAIUsage(["--ai-run", "a.md", "--dry-run"])
+                    && !SceneCLI.isLegacyAIUsage(["--ai-run", "a.md", "--json"])
+                    && !SceneCLI.isLegacyAIUsage(["--ai-run", "a.md", "--scene", "auto"]))
+            check("显式 --scene 不被 origin=record 覆盖",
+                  SceneMaterial.prepare(url: nil, origin: "record",
+                                        target: "00-收件箱",
+                                        forcedScene: .legacy).scene == .legacy)
+            check("未指定场景时 origin=record 仍判 transcript（旧行为不变）",
+                  SceneMaterial.prepare(url: nil, origin: "record",
+                                        target: "00-收件箱").scene == .transcript)
+            check("A11 归档退出码：全成 0 / 全败 1 / 部分成 3",
+                  SceneCLI.archiveExitCode(ok: 3, total: 3) == 0
+                    && SceneCLI.archiveExitCode(ok: 0, total: 3) == 1
+                    && SceneCLI.archiveExitCode(ok: 2, total: 3) == 3)
+
+            let frame = dropdownFrame(anchor: nil,
+                                      visible: NSRect(x: 0, y: 0, width: 800, height: 600),
+                                      size: PanelMetrics.dropdown)
+            check("400×520 下拉贴顶且居中",
+                  frame.width == 400 && frame.height == 520 && frame.origin.y == 80
+                    && frame.origin.x == 200)
+
+            let now = Date()
+            let ev = { (kind: String, ai: String) in
+                MetricEvent(kind: kind, ok: true, source: "archive",
+                            captureId: "cap-1", ai: ai, at: now)
+            }
+            let sum = MetricsQuery.summary(events: [ev("ai", "done"), ev("drop", "done")],
+                                           now: now, days: 7)
+            check("同 captureId 的 ai + 投递只计一次 AI", sum.aiDone == 1, "\(sum.aiDone)")
+
+            let doc = SceneMaterial.prepare(url: md, origin: "drop", target: "00-收件箱")
+            check("文档取文成功且带文件类型",
+                  doc.scene == .document && doc.reason.isEmpty)
+            var offCfg = AIConfig(); offCfg.enabled = false
+            AIConfigStore.overrideConfig = offCfg
+            let report = try? Filer(vault: t).file([md], target: "00-收件箱")
+            AIConfigStore.overrideConfig = nil
+            let note: String? = {
+                guard let rel = report?.outcomes.first?.noteRel else { return nil }
+                return try? String(contentsOf: t.appendingPathComponent(rel), encoding: .utf8)
+            }()
+            check("AI 关闭时文件笔记不含 1.7 新字段",
+                  note?.contains("AI场景") == false && note?.contains("摘要:") == false
+                    && note?.contains("类型: 文件归档") == true)
+
+            // A6.3 / A6.4：transcript 成功的 AI 行是单个 YAML 标量；
+            // 旧 done pending 没有润色稿，必须逐字保持 1.6.0，不升级模板。
+            let sr = AISceneResult(scene: .transcript, title: "部署记录",
+                                   summary: "部署测试环境并验证访问", tags: ["部署"],
+                                   polishedText: "今天部署测试环境。\n\n访问地址已验证，编号 12345。",
+                                   visibleText: "", edits: [], model: "m1", ms: 7,
+                                   truncated: false)
+            func readNote(_ o: DropOutcome?) -> String? {
+                guard let rel = o?.noteRel, !rel.isEmpty else { return nil }
+                return try? String(contentsOf: t.appendingPathComponent(rel), encoding: .utf8)
+            }
+            let polished = try? Filer(vault: t).memo(
+                text: "今天部署测试环境 访问地址已验证 编号 12345",
+                target: "00-收件箱", duration: 3, engine: "测试",
+                ai: sr.legacy, aiState: .done, sceneResult: sr)
+            let polishedNote = readNote(polished)
+            check("transcript 成功：AI 行整体加引号 + AI场景",
+                  polishedNote?.contains("AI: \"m1（7ms）\"") == true
+                    && polishedNote?.contains("AI场景: \"transcript\"") == true)
+            check("transcript 成功：润色正文与原始转写折叠引用",
+                  polishedNote?.contains("> [!quote]- 原始转写") == true
+                    && polishedNote?.contains("访问地址已验证") == true)
+            let oldPending = try? Filer(vault: t).memo(
+                text: "旧的一条转写", target: "00-收件箱", duration: 2,
+                engine: "测试", ai: sr.legacy, aiState: .done)
+            let oldNote = readNote(oldPending)
+            check("旧 done pending 逐字保持 1.6.0 AI 行且不升级场景",
+                  oldNote?.contains("AI: \"m1\"（7ms）") == true
+                    && oldNote?.contains("AI场景") == false
+                    && oldNote?.contains("[!quote]") == false)
+            check("天生 legacy 不记成 skipped",
+                  SceneMaterial.prepare(url: zip, origin: "drop",
+                                        target: "00-收件箱").reason.isEmpty)
+        }
+
         print("")
         print("自检结果：通过 \(passed)，失败 \(failed)")
         return failed == 0 ? 0 : 1
@@ -4999,6 +7028,11 @@ enum SelfTest {
 enum AutoUI {
     static var memoFile: URL?
     static var target: String?
+    /// 启动后直接打开看板 / AI 设置（`--dashboard` / `--ai-settings`）
+    static var openDashboard = false
+    static var openAISettings = false
+    /// 验收用：启动后直接展开下拉面板（没有辅助功能权限时也能截图核对）
+    static var showDropdown = false
     private static var finished = false
 
     static func finish(_ code: Int32, _ message: String) {
@@ -5065,6 +7099,10 @@ struct AppMain {
     static func main() {
         let args = CommandLine.arguments
 
+        // CLI 全是「打完日志就 exit」，异步日志队列里最后几条会被一起带走。
+        // 挂在 atexit 上，所有退出路径都能先排空（信号杀死除外，那种本来也没救）。
+        atexit { DiagLog.flush() }
+
         // 全局：--vault <路径> 覆盖库位置（只影响本次进程，不写入偏好）
         if let v = args.firstIndex(of: "--vault"), v + 1 < args.count {
             let p = (args[v + 1] as NSString).expandingTildeInPath
@@ -5106,6 +7144,123 @@ struct AppMain {
         if args.contains("--self-test") {
             exit(SelfTest.run())
         }
+
+        // 库内搜索：ObsidianDrop --search <关键词> [--limit N] [--json] [--no-spotlight]
+        // 退出码：0 有结果 / 1 无命中 / 2 用法或库错误
+        if let i = args.firstIndex(of: "--search") {
+            guard i + 1 < args.count, !args[i + 1].hasPrefix("--") else {
+                FileHandle.standardError.write(
+                    "用法：ObsidianDrop --search <关键词> [--limit N] [--json] [--no-spotlight]\n"
+                        .data(using: .utf8)!)
+                exit(2)
+            }
+            var limit = 20
+            if let l = args.firstIndex(of: "--limit"), l + 1 < args.count,
+               let n = Int(args[l + 1]) {
+                limit = min(max(n, 1), 100)
+            }
+            exit(SearchCLI.run(query: args[i + 1], limit: limit,
+                               json: args.contains("--json"),
+                               includeSpotlight: !args.contains("--no-spotlight")))
+        }
+
+        // 使用看板数据：--metrics [--json] [--days N] [--raw]
+        if args.contains("--metrics") {
+            var days = 7
+            if let i = args.firstIndex(of: "--days"), i + 1 < args.count,
+               let n = Int(args[i + 1]) {
+                days = min(max(n, 1), 365)
+            }
+            exit(MetricsCLI.run(json: args.contains("--json"), days: days,
+                                raw: args.contains("--raw")))
+        }
+
+        // AI 诊断：连接测试与单次处理，不启动界面
+        if args.contains("--ai-config") { exit(AICLI.config()) }
+        if args.contains("--ai-test") { exit(AICLI.test()) }
+        if let i = args.firstIndex(of: "--ai-set") {
+            var pairs: [String] = []
+            var j = i + 1
+            while j < args.count, !args[j].hasPrefix("--") {
+                pairs.append(args[j]); j += 1
+            }
+            guard !pairs.isEmpty else {
+                FileHandle.standardError.write(
+                    "用法：--ai-set enabled=on base=https://… model=… key=…\n".data(using: .utf8)!)
+                exit(2)
+            }
+            exit(AICLI.set(pairs))
+        }
+        // 1.7.0：场景化入口（--scene / --source / --archive / --mock-*）。
+        // 不带这些标志时 SceneCLI 会自动退回 1.6.0 的 --ai-run <文字> 行为。
+        // 批量 `--file a --file b` 允许不写 --ai-run，但只要带场景标志就必须
+        // 走这里，不能被下面 1.6.0 的 `--file` 归档命令截走并报「未知选项」。
+        let sceneOnlyFlags: Set<String> = ["--scene", "--source", "--archive", "--dry-run",
+                                           "--mock-response", "--mock-error", "--vision",
+                                           "--text"]
+        let sceneRoute = args.contains("--ai-run")
+            || (args.contains("--file") && args.contains(where: { sceneOnlyFlags.contains($0) }))
+        if sceneRoute {
+            if let i = args.firstIndex(of: "--ai-run") {
+                guard i + 1 < args.count else {
+                    FileHandle.standardError.write("用法：--ai-run <文件路径|文字> [--scene …]\n".data(using: .utf8)!)
+                    exit(2)
+                }
+            }
+            exit(SceneCLI.run(args))
+        }
+
+        // 归档链路自验：把一段文字当成「刚转写完的结果」走完 pending → AI → 笔记。
+        // 没有麦克风的机器也能验这一段，而且验的正是 1.5.0 唯一挂载点是否真的生效。
+        if let i = args.firstIndex(of: "--memo-test") {
+            guard i + 1 < args.count else {
+                FileHandle.standardError.write("用法：--memo-test <文字> [--target 目标]\n"
+                    .data(using: .utf8)!)
+                exit(2)
+            }
+            var target = Cfg.storedTarget
+            if let t = args.firstIndex(of: "--target") {
+                guard t + 1 < args.count, !args[t + 1].hasPrefix("--") else {
+                    FileHandle.standardError.write("用法：--target 缺少目标值\n".data(using: .utf8)!)
+                    exit(2)
+                }
+                target = args[t + 1]
+            }
+            let tmpPending = URL(fileURLWithPath: NSTemporaryDirectory())
+                .appendingPathComponent("od-memo-test-\(UUID().uuidString)", isDirectory: true)
+            PendingStore.overrideDirectory = tmpPending
+            defer { try? FileManager.default.removeItem(at: tmpPending) }
+            let m = PendingMemo(id: UUID().uuidString, text: args[i + 1], duration: 3,
+                                target: target, vaultPath: Cfg.vault.path,
+                                engine: "cli-test", audioPath: "", source: "record",
+                                createdAt: Date(), attempts: 0)
+            do {
+                try PendingStore.enqueue(m)
+                guard let out = try MemoArchiveQueue.archive(m) else {
+                    print("没有归档（pending 已被别的路径处理）")
+                    exit(1)
+                }
+                print("笔记: \(out.noteRel)")
+                let full = Cfg.vault.appendingPathComponent(out.noteRel)
+                if let text = try? String(contentsOf: full, encoding: .utf8) {
+                    let head = text.components(separatedBy: "\n").prefix(9).joined(separator: "\n")
+                    print("—— 前 9 行 ——")
+                    print(head)
+                }
+                let left = PendingStore.count
+                print("剩余 pending: \(left)")
+                exit(0)
+            } catch {
+                FileHandle.standardError.write("错误：\(error.localizedDescription)\n"
+                    .data(using: .utf8)!)
+                exit(1)
+            }
+        }
+
+        // 界面入口：--dashboard / --ai-settings（启动 App 并直接打开那个窗口）
+        if args.contains("--dashboard") { AutoUI.openDashboard = true }
+        if args.contains("--show-dropdown") { AutoUI.showDropdown = true }
+        if args.contains("--ai-settings") { AutoUI.openAISettings = true }
 
         // 命令行模式：开机启动开关
         if args.contains("--login") {
@@ -5154,11 +7309,23 @@ struct AppMain {
                 exit(r.message == "已取消" ? 0 : 1)
             }
             do {
-                let report = try Filer(vault: Cfg.vault).file([f], target: target)
-                try? FileManager.default.removeItem(at: f)
+                // 1.7.0：命令行截图也是截图。以前这里没带 context，来源退化成 drop、
+                // 来源目录写成临时路径，无扩展名截图也走不到 ImageIO 的截图专用分支。
+                // 与 GUI 的 finishScreenshot 用同一套上下文。
+                let budget = AIBatchBudget(cap: AIConfigStore.config.effectiveBudget)
+                let ctx = ArchiveContext(source: "screenshot", scene: .image,
+                                         target: target, sourceURL: f, batchBudget: budget)
+                let report = try Filer(vault: Cfg.vault).file([f], target: target,
+                                                              contexts: [ctx])
+                // 失败时保留临时 PNG：库里没有笔记、附件也回滚了，它是唯一副本。
                 if let failure = report.failures.first {
-                    FileHandle.standardError.write("错误：\(failure.reason)\n".data(using: .utf8)!)
+                    FileHandle.standardError.write(
+                        "错误：\(failure.reason)\n源图已保留：\(f.path)\n".data(using: .utf8)!)
                     exit(1)
+                }
+                if ScreenshotCleanup.canDiscard(failures: report.failures.count,
+                                                noteRel: report.outcomes.first?.noteRel ?? "") {
+                    try? FileManager.default.removeItem(at: f)
                 }
                 for x in report.outcomes {
                     print("笔记: \(x.noteRel)")
@@ -5166,7 +7333,8 @@ struct AppMain {
                 }
                 exit(0)
             } catch {
-                FileHandle.standardError.write("错误：\(error.localizedDescription)\n".data(using: .utf8)!)
+                FileHandle.standardError.write(
+                    "错误：\(error.localizedDescription)\n源图已保留：\(f.path)\n".data(using: .utf8)!)
                 exit(1)
             }
         }
@@ -5180,26 +7348,59 @@ struct AppMain {
                 ? (args[i + 1] as NSString).expandingTildeInPath
                 : NSTemporaryDirectory()
             _ = NSApplication.shared
-            let size = NSSize(width: 160, height: 176)
+            // --appearance light|dark：把基线钉死在指定外观，不受「系统自动切深色」
+            // 影响。否则同一条命令白天/晚上拍出来的图不一样，没法做回归对比。
+            if let a = args.firstIndex(of: "--appearance"), a + 1 < args.count {
+                switch args[a + 1] {
+                case "dark": NSApp.appearance = NSAppearance(named: .darkAqua)
+                case "light": NSApp.appearance = NSAppearance(named: .aqua)
+                default: break
+                }
+            }
             let out = URL(fileURLWithPath: dir)
-            try? FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
+            do {
+                try FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
+            } catch {
+                FileHandle.standardError.write("错误：无法创建 \(out.path)：\(error.localizedDescription)\n".data(using: .utf8)!)
+                exit(1)
+            }
 
-            func shot(_ name: String, _ body: (DropView) -> Void) {
+            // 只读沙箱里曾经 21 张全写失败却仍打印「已输出」并 exit 0——
+            // 那会让「界面基线通过」变成一句空话。逐张记成败，少一张就退出 1。
+            var failedShots: [String] = []
+            // 尺寸现在有两种：常驻 160×176 / 下拉 400×520（1.7.0）。
+            // 排版错没错不该靠猜——两种形态、所有状态都出一张图。
+            func shot(_ name: String, size: NSSize = PanelMetrics.docked,
+                      _ body: (DropView) -> Void) {
                 let v = DropView(frame: NSRect(origin: .zero, size: size))
+                // 真机里面板是「先显示、再进状态」，离屏也先排一次版，
+                // 否则状态先设定会跳过 layout 里的 idle 标题替换，基线图就失真了。
+                v.layoutSubtreeIfNeeded()
                 body(v)
                 v.layoutSubtreeIfNeeded()
-                guard let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) else { return }
+                guard let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) else {
+                    failedShots.append("\(name)（无法离屏缓存）")
+                    return
+                }
                 // 毛玻璃在离屏渲染里是空心的，先铺底色才看得清排版
                 NSGraphicsContext.saveGraphicsState()
                 if let ctx = NSGraphicsContext(bitmapImageRep: rep) {
                     NSGraphicsContext.current = ctx
-                    NSColor(calibratedWhite: 0.98, alpha: 1).setFill()
+                    let isDark = v.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+                    NSColor(calibratedWhite: isDark ? 0.10 : 0.98, alpha: 1).setFill()
                     NSRect(origin: .zero, size: v.bounds.size).fill()
                 }
                 v.cacheDisplay(in: v.bounds, to: rep)
                 NSGraphicsContext.restoreGraphicsState()
                 if let data = rep.representation(using: .png, properties: [:]) {
-                    try? data.write(to: out.appendingPathComponent("\(name).png"))
+                    do {
+                        try data.write(to: out.appendingPathComponent("\(name).png"),
+                                       options: .atomic)
+                    } catch {
+                        failedShots.append("\(name)（写入失败）")
+                    }
+                } else {
+                    failedShots.append("\(name)（无法编码）")
                 }
             }
 
@@ -5218,6 +7419,102 @@ struct AppMain {
                               partial: "")
             }
             shot("6-saving") { $0.renderMemo(.transcribing(.saving(312)), partial: "") }
+
+            shot("7-dropdown-empty", size: PanelMetrics.dropdown) { _ in }
+            shot("8-dropdown-results", size: PanelMetrics.dropdown) { v in
+                v.setResults([
+                    SearchRow(kind: .vault, path: "30-资源/预焙阳极工艺参数.md",
+                              title: "预焙阳极工艺参数",
+                              detail: "煅烧温度 1250–1300℃，成型压力 160MPa…"),
+                    SearchRow(kind: .vault, path: "10-项目/强强碳素/评审问题清单.md",
+                              title: "评审问题清单",
+                              detail: "预焙阳极车间数据采集频次需要与 MES 对齐…"),
+                    SearchRow(kind: .local, path: "~/Downloads/预焙阳极行业报告.pdf",
+                              title: "预焙阳极行业报告.pdf", detail: "~/Downloads/预焙阳极行业报告.pdf"),
+                ], empty: "")
+            }
+            shot("9-dropdown-noresult", size: PanelMetrics.dropdown) { v in
+                v.setResults([], empty: "没有匹配「预焙阳极」的笔记，换个词试试")
+            }
+
+            // ===== 1.7.0 规格 B：下拉形态的 10 个状态基线 =====
+            let dd = PanelMetrics.dropdown
+            let rows = [
+                SearchRow(kind: .vault, path: "30-资源/预焙阳极工艺参数.md",
+                          title: "预焙阳极工艺参数",
+                          detail: "煅烧温度 1250–1300℃，成型压力 160MPa…"),
+                SearchRow(kind: .vault, path: "10-项目/强强碳素/评审问题清单.md",
+                          title: "评审问题清单",
+                          detail: "预焙阳极车间数据采集频次需要与 MES 对齐…"),
+                SearchRow(kind: .local, path: "~/Downloads/预焙阳极行业报告.pdf",
+                          title: "预焙阳极行业报告.pdf", detail: "~/Downloads/预焙阳极行业报告.pdf"),
+            ]
+            // idle 走真实入口：目标名 + 结果区空态提示（showDropdown 时由控制器写入）
+            func idle(_ v: DropView) {
+                v.setTargetName("00-收件箱")
+                v.setResults([], empty: "输入关键词，同时搜库内笔记与本机文件")
+                v.renderScene(.legacy)
+            }
+            shot("10-v170-idle", size: dd) { idle($0) }
+            shot("11-v170-dragover", size: dd) { idle($0); $0.setHighlight(true) }
+            shot("12-v170-recording", size: dd) {
+                idle($0)
+                $0.renderMemo(.recording(23, 0.62), partial: "")
+            }
+            shot("13-v170-transcribing", size: dd) {
+                idle($0)
+                $0.renderMemo(.transcribing(.analyzing(processed: 40, total: 120, chars: 63)),
+                              partial: "")
+            }
+            shot("14-v170-ai-document", size: dd) {
+                idle($0)
+                $0.renderScene(.document)
+                $0.renderAI(.working, phase: "提取文字", detail: "生成摘要概览")
+            }
+            shot("15-v170-ai-transcript", size: dd) {
+                idle($0)
+                $0.renderScene(.transcript)
+                $0.renderAI(.working, phase: "润色分段", detail: "生成概览 · 修正错病语")
+            }
+            shot("16-v170-ai-image", size: dd) {
+                idle($0)
+                $0.renderScene(.image)
+                $0.renderAI(.working, phase: "识别图片", detail: "生成概览")
+            }
+            shot("17-v170-success", size: dd) {
+                idle($0)
+                $0.renderScene(.document)
+                $0.flash("已归档 3 个", ok: true)
+                $0.renderBatch(success: 3, failed: 0)
+            }
+            shot("18-v170-error", size: dd) {
+                idle($0)
+                $0.renderScene(.image)
+                $0.flash("失败", ok: false)
+                $0.renderAI(.failed, phase: "识别失败", detail: "已按原模式归档")
+            }
+            shot("19-v170-searching", size: dd) {
+                idle($0)
+                $0.searchField.stringValue = "预焙阳极"
+                $0.setSearching(true)
+                $0.renderAI(.working, phase: "搜索中", detail: "库内全文 + Spotlight")
+            }
+            shot("20-v170-results", size: dd) {
+                idle($0)
+                $0.searchField.stringValue = "预焙阳极"
+                $0.setResults(rows, empty: "")
+            }
+            shot("21-v170-empty", size: dd) {
+                idle($0)
+                $0.searchField.stringValue = "不存在的词"
+                $0.setResults([], empty: "没有匹配的笔记，换个词试试")
+            }
+            if !failedShots.isEmpty {
+                FileHandle.standardError.write(
+                    "错误：\(failedShots.count) 张界面基线图未生成：\(failedShots.joined(separator: "、"))\n"
+                        .data(using: .utf8)!)
+                exit(1)
+            }
             print("已输出到 \(out.path)")
             exit(0)
         }

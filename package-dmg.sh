@@ -15,6 +15,16 @@ if [ "${1:-}" != "--no-build" ]; then
 fi
 
 [ -d "$APP" ] || { echo "找不到 $APP，先跑 ./build.sh"; exit 1; }
+# 1.7.0：图标是交付内容的一部分，打包前先验一遍，别把「没图标」打进 dmg。
+for f in AppIcon.icns MenuBarTemplate.png "MenuBarTemplate@2x.png"; do
+  [ -f "$APP/Contents/Resources/$f" ] || {
+    echo "❌ app 里缺少 Resources/$f，先跑 ./build.sh"; exit 1; }
+done
+ICON_NAME=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' \
+             "$APP/Contents/Info.plist" 2>/dev/null || true)
+if [ "$ICON_NAME" != "AppIcon.icns" ]; then
+  echo "❌ Info.plist 未声明 AppIcon.icns（实际：$ICON_NAME）"; exit 1
+fi
 
 VER=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" \
         "$APP/Contents/Info.plist" 2>/dev/null || echo "0.0.0")
@@ -38,7 +48,8 @@ ObsidianDrop 安装说明
      右键点它 → 打开 → 再点「打开」；
    或执行：xattr -dr com.apple.quarantine /Applications/ObsidianDrop.app
 
-3. 首次运行会在屏幕右下角出现小窗，菜单栏出现托盘图标（方框+下箭头）。
+3. 首次运行会在屏幕右下角出现小窗，菜单栏出现托盘图标（深色底 + 白纸 + 向下箭头，
+   深浅模式自动反相）。左键点图标打开 400×520 下拉面板，右键打开菜单。
 
 4. 权限（按需，用到才提示）：
    · 拖文件报「Operation not permitted」
@@ -61,10 +72,28 @@ ObsidianDrop 安装说明
       直接从 dmg 窗口里双击，每次挂载的路径都不一样，系统会当成
       另一个新程序，麦克风/截屏授权会反复失效。
 
+   ⚠️ 只保留一份 ObsidianDrop。若「应用程序」里已有旧版，拖入时会直接覆盖；
+      若之前用开发脚本装过，可能还留在 ~/Applications/ObsidianDrop.app。
+      两份是同一个 Bundle ID，同时存在会出现两个菜单栏图标，而且 macOS 的
+      麦克风 / 截屏 / 完全磁盘访问授权是按路径记的，会反复失效。
+      处理方法：退出正在运行的 ObsidianDrop，删掉不用的那一份，再从
+      /Applications 打开新版；Finder 与启动台里的图标也会随之更新。
+
 5. 开机自启：托盘菜单 →「开机自动启动」。
 
-完整说明见源码目录里的 使用说明.md
+6. 本版新增：AI 分场景处理（文件做摘要 / 转录润色分段 / 截图识别画面，
+   其他类型按旧模式）、重设计的下拉面板、应用与菜单栏图标。
+   AI 默认关闭；要用请在「打开 → AI 模型配置…」里填接口与 Key，
+   用视觉模型时可在「视觉模型」栏单独指定，留空则跟随文字模型。
+   AI 失败或未配置时笔记照常入库，只是没有摘要，不会丢内容。
+
+完整说明见源码目录里的 使用说明.md 与 发布说明-1.7.0.html
 TXT
+
+# 发布说明一起放进 dmg，用户挂载后能直接看
+if [ -f "$SRC_DIR/docs/发布说明-1.7.0.html" ]; then
+  cp "$SRC_DIR/docs/发布说明-1.7.0.html" "$STAGE/1.7.0 发布说明.html"
+fi
 
 echo "==> 生成 $DMG"
 mkdir -p "$DIST"
@@ -86,6 +115,10 @@ else
   echo "  ❌ dmg 内应用异常"
 fi
 [ -L "/tmp/obsidiandrop-dmg-check/Applications" ] && echo "  ✅ Applications 快捷方式就位"
+[ -f "/tmp/obsidiandrop-dmg-check/$APP_NAME.app/Contents/Resources/AppIcon.icns" ] \
+  && echo "  ✅ 应用图标就位" || echo "  ❌ dmg 内缺应用图标"
+[ -f "/tmp/obsidiandrop-dmg-check/$APP_NAME.app/Contents/Resources/MenuBarTemplate.png" ] \
+  && echo "  ✅ 菜单栏图标就位" || echo "  ❌ dmg 内缺菜单栏图标"
 codesign -v "/tmp/obsidiandrop-dmg-check/$APP_NAME.app" 2>/dev/null \
   && echo "  ✅ 签名校验通过" || echo "  ⚠️ 未签名或签名不完整（ad-hoc，仍可运行）"
 hdiutil detach /tmp/obsidiandrop-dmg-check >/dev/null 2>&1 || true
