@@ -6,6 +6,7 @@
 [![Swift](https://img.shields.io/badge/Swift-5-orange)]()
 [![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)]()
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![Release](https://img.shields.io/badge/release-v1.7.0-blue)](https://github.com/LuWeiCQ/ObsidianDrop/releases)
 
 ![投放窗口](docs/images/panel.png)
 
