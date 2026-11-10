@@ -856,6 +856,10 @@ struct MemoOutcome {
     var peak: Float = 0
     /// 是否出现过音频格式转换失败
     var broken: Bool = false
+    /// 写录音文件失败的次数（磁盘满、权限、格式突变都可能）
+    var writeErrors: Int = 0
+    /// 录音没完整落盘：转写内容可能缺一截，界面必须说清楚（build 25）
+    var incompleteRecording: Bool { writeErrors > 0 }
     /// 是否来自音频文件（而不是现场录音）
     var fromFile: Bool = false
     /// 录音原始文件（1.3.11 起：录音先落盘再按文件转写，失败时这个文件还在）
@@ -2979,6 +2983,7 @@ final class MemoSession {
             o.fed = recorded
             o.peak = peak
             o.broken = errors > 0
+            o.writeErrors = errors
             DiagLog.round(run, "录音文件里没有音频，不进入转写")
             emit("done.无音频") { s, r in
                 s.memoDone(text: "", duration: wall, outcome: o,
@@ -3014,6 +3019,7 @@ final class MemoSession {
                 o.chars = r.text.count
                 o.peak = peak
                 o.broken = errors > 0
+                o.writeErrors = errors
                 // 录音**一律留着**，等笔记真正写成功再由归档环节删。
                 // 1.3.13 在这里就 `store.discard()`，紧接着才投递结果——
                 // 投递一失败，文字和录音就同时没了。先落盘、先保命。
@@ -3051,6 +3057,7 @@ final class MemoSession {
                 o.fed = 0
                 o.peak = peak
                 o.broken = errors > 0
+                o.writeErrors = errors
                 o.recordingPath = audio.path
                 DiagLog.round(run, "转写抛错：\(error.localizedDescription)，交付 done.异常")
                 self.emit("done.异常") { s, r in s.memoDone(text: "", duration: recorded, outcome: o, error: error, run: r) }
@@ -5492,6 +5499,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSWorkspace.shared.open(url)
     }
 
+    /// 录音有段落没写进文件时，归档后必须明确告警（build 25）。
+    ///
+    /// 以前只把次数写进日志和「0 字诊断」，正常归档时用户看到的是「灵感已归档」，
+    /// 完全不知道后面一截音频根本没录上。不限时长后一次录音可能几百 MB，
+    /// 磁盘写满的概率不再可以忽略。
+    private func warnIncompleteRecording(_ o: MemoOutcome) {
+        guard o.incompleteRecording else { return }
+        let n = o.writeErrors
+        DiagLog.write("注意：本轮录音有 \(n) 段没写进文件，转写内容可能不完整")
+        dropView.flash("录音有 \(n) 段没写进去", ok: false)
+        let a = NSAlert()
+        a.messageText = "录音没有完整写入"
+        a.informativeText = "有 \(n) 段音频没写进文件（多半是磁盘空间不足或写入出错），"
+            + "转写内容可能缺一截；已经识别出来的部分已入库。\n\n"
+            + "录音文件：\(o.recordingPath.isEmpty ? "（未记录路径）" : o.recordingPath)"
+        a.alertStyle = .warning
+        a.addButton(withTitle: "好")
+        NSApp.activate(ignoringOtherApps: true)
+        a.runModal()
+    }
+
     private func memoAlert(_ error: Error, saved: String = "") {
         let a = NSAlert()
         a.messageText = "录音失败"
@@ -5887,6 +5915,7 @@ extension AppDelegate: MemoSink {
             DiagLog.round(run, "这条已被补归档写过（pending \(outcome.pendingID) 已消失），不重复写")
             dropView.renderMemo(.idle, partial: "")
             dropView.flash("灵感已归档", ok: true)
+            warnIncompleteRecording(outcome)
             AutoUI.finish(0, "OK 已由补归档写入：\(trimmed.count) 字")
             return
         }
@@ -5931,6 +5960,7 @@ extension AppDelegate: MemoSink {
                     }
                     self.dropView.renderMemo(.idle, partial: "")
                     self.dropView.flash("灵感已归档", ok: true)
+                    self.warnIncompleteRecording(outcome)
                     if let out { NSLog("ObsidianDrop: 灵感 → \(out.noteRel)") }
                     if autoOpen, let out { self.openNote(rel: out.noteRel) }
                     AutoUI.finish(0, "OK 界面已复位并归档：\(out?.noteRel ?? "（已由其他路径归档）")")
@@ -6508,6 +6538,10 @@ enum SelfTest {
 
             // ②.5 录音不限时长（build 23）：上限开关必须为空，且超过 1 小时能正确显示
             check("录音不设时长上限", Memo.maxSeconds == nil)
+            var partial = MemoOutcome()
+            partial.writeErrors = 3
+            check("录音写失败会标记为不完整",
+                  partial.incompleteRecording && !MemoOutcome().incompleteRecording)
             check("超过 1 小时显示 h:mm:ss",
                   Memo.clock(3661) == "1:01:01" && Memo.clock(7200) == "2:00:00",
                   "\(Memo.clock(3661)) / \(Memo.clock(7200))")
