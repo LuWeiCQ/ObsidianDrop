@@ -42,7 +42,7 @@ ObsidianDrop 把这一步压成一个动作：**拖／截／说**。库外的东
 | **应用图标** | 深色圆角底 + 暖白纸张 + 紫蓝向下箭头 + 青色落点光；`.icns` 十档齐全，菜单栏使用单色 template 图，暗色模式自动适配 |
 | **多目标切换** | 菜单栏随时切换落库目录（默认 `00-收件箱`），设置持久化 |
 | **开机自启** | 基于 `SMAppService`，菜单栏一键开关 |
-| **可诊断** | 内置 `--audio-check` / `--self-test`（205 项）/ `--ui-memo` / `--search` / `--metrics` / `--ai-test` / `--ai-run --scene` / `--render-preview` 等命令，出问题先自证，不用猜 |
+| **可诊断** | 内置 `--audio-check` / `--self-test`（209 项）/ `--ui-memo` / `--search` / `--metrics` / `--ai-test` / `--ai-run --scene` / `--render-preview` 等命令，出问题先自证，不用猜 |
 
 ## 生成的笔记长什么样
 
@@ -124,7 +124,7 @@ BIN=/Applications/ObsidianDrop.app/Contents/MacOS/ObsidianDrop
 | `$BIN --shot full\|area\|window\|clipboard [--target <目录>]` | 截图并归档；`clipboard` 只进剪贴板 |
 | `$BIN --transcribe <音频> [--target <目录>] [--out <文件>]` | 转写一个音频文件并归档 |
 | `$BIN --audio-check [--json]` | 设备与权限诊断（麦克风、语音模型、库路径） |
-| `$BIN --self-test` | 205 项内部不变量自检（含三场景分类、图片编码、润色校验、独占发布、批次预算、B2 布局坐标、下拉尺寸、埋点去重、旧模板兼容） |
+| `$BIN --self-test` | 209 项内部不变量自检（含三场景分类、图片编码、润色校验、独占发布、批次预算、B2 布局坐标、下拉尺寸、埋点去重、旧模板兼容） |
 | `$BIN --search <关键词> [--limit N] [--json] [--no-spotlight]` | 库内全文搜索；退出码 0 有结果 / 1 无命中 / 2 用法或库错误 |
 | `$BIN --metrics [--days N] [--json] [--raw]` | 使用看板的口径数据；`--raw` 输出脱敏后的原始事件 |
 | `$BIN --ai-config` / `--ai-set enabled=on base=… model=… vision=… key=…` | 查看 / 写入 AI 配置（Key 写系统钥匙串；`vision` 留空则用文字模型） |
@@ -170,7 +170,7 @@ BIN=/Applications/ObsidianDrop.app/Contents/MacOS/ObsidianDrop
 ./build.sh                              # 编译 + 安装
 bash scripts/regression.sh              # 56 项回归（自动编译，全在临时库里跑）
 BIN=/path/to/ObsidianDrop bash scripts/regression.sh   # 用已有二进制
-$BIN --self-test                        # 205 项内部自检
+$BIN --self-test                        # 209 项内部自检
 ```
 
 回归测试**从不触碰真实 Obsidian 库**：每个用例用 `mktemp` 建临时库并通过 `--vault` 覆盖。

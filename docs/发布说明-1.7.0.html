@@ -67,7 +67,7 @@
   <h1>ObsidianDrop 1.7.0<br>AI 分场景，面板重做，补上图标</h1>
   <div class="sub">文件做摘要 · 转录润色分段改错病语 · 截图识别画面 · 其他类型照旧 · 下拉面板 400×520 · App / 菜单栏 ICON。仍是零依赖、单二进制、只新建笔记。</div>
   <div class="badges">
-    <span class="badge ok">自检 205 / 205</span>
+    <span class="badge ok">自检 209 / 209</span>
     <span class="badge ok">回归 56 / 56</span>
     <span class="badge ok">E2E 六例通过</span>
     <span class="badge">macOS 13+ / arm64</span>
@@ -172,7 +172,7 @@ $ /usr/bin/plutil -lint …/Info.plist           OK
 $ /usr/bin/iconutil -c iconset …/AppIcon.icns  10 个档位
 
 $ ObsidianDrop --self-test
-自检结果：通过 205，失败 0
+自检结果：通过 209，失败 0
 
 $ bash scripts/regression.sh
 回归结果：通过 56，失败 0
@@ -232,7 +232,7 @@ runProcess 超限   12 MiB 假 XLSX → 0.18s 降级 legacy，无挂起、无无
   <li>转写收尾超时按音频长度放宽：finalize 上限 180s → <strong>900s</strong>，结果流 5s → <strong>120s</strong>；<strong>录音与文件转写两条路径都改了</strong>（录音结束实际走 <code>transcribeFile</code>，只改实时转写那条等于没改），否则超长录音的尾巴会被截掉。</li>
   <li>录音写入失败不再静默：以前只把次数写进日志，界面照样显示「灵感已归档」。现在归档后会明确提示「有 N 段没写进去」并给出录音文件路径——不限时长后一次录音可能几百 MB，磁盘写满的概率不再可以忽略。</li>
 </ul>
-<p>自检新增 4 条断言（不设上限、h:mm:ss、1 小时内仍 m:ss、写失败标记），总数 205 → <strong>209</strong>。录音文件的写入本身是流式的，不受时长影响；1 小时约 115 MB（16 kHz / 16 bit / 单声道），转写成功即删。</p>
+<p>自检新增 4 条断言（不设上限、h:mm:ss、1 小时内仍 m:ss、写失败标记），总数 205 → <strong>209</strong>。录音文件的写入本身是流式的，不受时长影响；按实测 362.4 秒 / 31.97 MB 折算约 300 MB/小时（16 kHz / 16 bit / 单声道），转写成功即删。</p>
 
 <h2>6 已知限制</h2>
 <ul>
