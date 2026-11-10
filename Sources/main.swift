@@ -956,8 +956,11 @@ enum MemoError: LocalizedError {
 }
 
 enum Memo {
-    /// 单次录音上限（秒）。超时自动结束并转写。
-    static let maxSeconds: Double = 300
+    /// 单次录音上限（秒）。`nil` = 不限时长（1.7.0 build 23 起）。
+    ///
+    /// 保留这个开关而不是删掉判断：将来若要恢复上限只改这里一处，
+    /// 自检也能直接断言 `== nil`，不用去读计时器实现。
+    static let maxSeconds: Double? = nil
 
     /// 没有可用输入设备时的建议文案。
     ///
@@ -981,6 +984,11 @@ enum Memo {
     /// 0:07 / 1:23 这种计时显示
     static func clock(_ t: TimeInterval) -> String {
         let s = max(0, Int(t.rounded(.down)))
+        // 录音不限时长后必须支持小时位：否则 2 小时会显示成 120:00，
+        // 看起来像分钟数溢出。
+        if s >= 3600 {
+            return String(format: "%d:%02d:%02d", s / 3600, (s % 3600) / 60, s % 60)
+        }
         return String(format: "%d:%02d", s / 60, s % 60)
     }
 
@@ -2116,7 +2124,7 @@ final class SpeechRunner {
     /// 导致面板一直卡在「正在转成文字…」。`finish()` 现在为两步都加上超时兜底，
     /// 即便系统转写内核卡死，也会在限时后强制收尾并返回已累计的文本。
     ///
-    /// 超时上限**跟着音频长度走**：实时录音（≤5 分钟）边录边转、积压很少，10 秒够了；
+    /// 超时上限**跟着音频长度走**：短录音积压很少，10 秒够了；
     /// 但「转写音频文件」是把整个文件按最大速度灌进分析器，喂完时分析器里还积压着
     /// 大段未消化的音频（实测 1 小时音频灌入只要十几秒，分析却要几十秒），
     /// 固定 10 秒会把尾巴整段丢掉。
@@ -2128,10 +2136,12 @@ final class SpeechRunner {
         continuation.finish()
 
         let audioSeconds = fedSeconds
-        // 约 30 倍实时（下限 10s，上限 3 分钟）——实测分析吞吐在 90 倍实时左右，留足余量
-        let finalizeLimit = min(max(10.0, audioSeconds / 30.0), 180.0)
+        // 约 30 倍实时（下限 10s）——实测分析吞吐在 90 倍实时左右，留足余量。
+        // 录音不限时长后，上限必须跟着放大：旧版 180s 只够撑到约 4 小时音频，
+        // 现在放到 15 分钟，半天会议也收得回来。
+        let finalizeLimit = min(max(10.0, audioSeconds / 30.0), 900.0)
         // 结果流收尾只需等分析器把最后一批结果吐完，比 finalize 短
-        let drainLimit = min(max(5.0, audioSeconds / 120.0), 30.0)
+        let drainLimit = min(max(5.0, audioSeconds / 120.0), 120.0)
 
         // 收尾期间每 0.5 秒报一次「已经等了多久」。
         // 这段最容易被误判成卡死：实时录音时它通常 1~3 秒，长音频可以到十几秒。
@@ -2897,7 +2907,7 @@ final class MemoSession {
                 //    这里的两次 isStopped 检查不是多余的：用户可能在
                 //    「要权限」的弹窗上就点了取消/结束。若此时还去建文件、
                 //    起引擎，就会留下一个没人管的录音会话——文件一直长，
-                //    5 分钟上限也不会触发（计时器已经停了）。
+                //    而自动结束计时器已经停了，不会有人来收尾。
                 guard !self.isStopped else { return }
                 self.store = try RecordingStore()
                 guard !self.isStopped else {
@@ -3832,7 +3842,7 @@ final class DropView: NSView {
             // 1.3.11 起录音只存不转（转写等录完按文件做），所以这里不显示实时文字，
             // 改为「确认在收音」的两件事：音量呼吸 + 已录时长
             subtitle.stringValue = "说完点「结束」，再转成文字"
-            hintLabel.stringValue = "音频先存到本地 · 最长 5 分钟"
+            hintLabel.stringValue = "音频先存到本地 · 不限时长"
             memoButton.setStyle(title: "结束", symbol: "stop.fill",
                                 tint: .systemRed, tip: "结束录音并转成文字")
             shotButton.setStyle(title: "截屏", symbol: "camera.viewfinder",
@@ -5296,7 +5306,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard let self, self.memoState == .recording else { return }
             let elapsed = self.memoStartedAt.map { Date().timeIntervalSince($0) } ?? 0
             self.dropView.renderMemo(.recording(elapsed, self.lastLevel), partial: self.lastPartial)
-            if elapsed >= Memo.maxSeconds {
+            // 不设上限时只更新计时显示，录音一直继续，直到用户点「结束」
+            if let cap = Memo.maxSeconds, elapsed >= cap {
                 self.endMemo()
             }
         }
@@ -6491,6 +6502,15 @@ enum SelfTest {
             check("半截 JSON 被跳过", PendingStore.all().count == 1, "\(PendingStore.all().count)")
             PendingStore.remove(id: m.id)
             check("归档后能清掉", PendingStore.all().isEmpty)
+
+            // ②.5 录音不限时长（build 23）：上限开关必须为空，且超过 1 小时能正确显示
+            check("录音不设时长上限", Memo.maxSeconds == nil)
+            check("超过 1 小时显示 h:mm:ss",
+                  Memo.clock(3661) == "1:01:01" && Memo.clock(7200) == "2:00:00",
+                  "\(Memo.clock(3661)) / \(Memo.clock(7200))")
+            check("1 小时以内仍是 m:ss",
+                  Memo.clock(59) == "0:59" && Memo.clock(65) == "1:05" && Memo.clock(3599) == "59:59",
+                  "\(Memo.clock(3599))")
 
             // ③ 覆盖率：文字盖住了音频的哪些段落
             if #available(macOS 26.0, *) {

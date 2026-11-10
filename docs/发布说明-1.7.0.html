@@ -205,7 +205,7 @@ $ ObsidianDrop --render-preview review/ui-1.7.0     21 张 PNG</code></pre>
 
 归档退出码（A11）  单项成功 0 · 全部失败 1 · 批量部分成功 3（含 succeeded/failed）
 runProcess 超限   12 MiB 假 XLSX → 0.18s 降级 legacy，无挂起、无无界读</code></pre>
-<p class="muted">最终二进制 SHA256 <code>24f2469f5bc42bf081776b28baff5e0d23926f2f2b25013a03b80f9a356cfb06</code>，
+<p class="muted">最终二进制 SHA256 <code>5989534918b66758124845da26881c21d8028af803b244226fc85eae1b4dffcd</code>，
 与 app bundle、dmg 内可执行文件三处一致。浅/深 UI 基线各 21 张均由这份最终二进制重生成并存档；
 深色 21 张已由主代理逐张目检并补写结论，见 <code>review/UI-目检记录-1.7.0.md</code> 的深色章节。</p>
 
@@ -223,6 +223,16 @@ runProcess 超限   12 MiB 假 XLSX → 0.18s 降级 legacy，无挂起、无无
 且菜单栏进程可能仍在跑替换前的旧代码；已把新版装到 <code>/Applications</code>、重启进程并刷新图标登记，安装说明也加了「只保留一份」的提示。
 深色「就绪」徽标对比度偏淡同步修正（文字最亮像素 179 → 224），浅 / 深各 21 张基线用最终二进制重生成。</p>
 
+<h2>5.2 录音不限时长（build 23）</h2>
+<p>原来是「单次 5 分钟、到点自动结束并转写」。现在改成<strong>不设上限</strong>：录音一直继续，只有点「结束」才停。改动落在四处：</p>
+<ul>
+  <li><code>Memo.maxSeconds</code> 从 <code>300</code> 改为 <code>Double?</code> 并置 <code>nil</code>，计时器里的自动结束加 <code>if let</code> 守卫；保留这个开关，将来要恢复上限只改一处。</li>
+  <li>录音提示文案改为「音频先存到本地 · 不限时长」。</li>
+  <li><code>Memo.clock</code> 增加小时位：≥1 小时显示 <code>h:mm:ss</code>，否则 2 小时会显示成 <code>120:00</code>，看着像分位溢出。</li>
+  <li>转写收尾超时按音频长度放宽：finalize 上限 180s → <strong>900s</strong>，结果流 30s → <strong>120s</strong>，否则超长录音的尾巴会被截掉。</li>
+</ul>
+<p>自检新增 3 条断言（不设上限、h:mm:ss、1 小时内仍 m:ss），总数 205 → <strong>208</strong>。录音文件的写入本身是流式的，不受时长影响；1 小时约 115 MB（16 kHz / 16 bit / 单声道），转写成功即删。</p>
+
 <h2>6 已知限制</h2>
 <ul>
   <li>视觉识别需要模型本身支持图片输入；不支持时（如 415）会降级成旧模板，笔记照常入库。</li>
@@ -238,7 +248,7 @@ runProcess 超限   12 MiB 假 XLSX → 0.18s 降级 legacy，无挂起、无无
 
 <footer>
   ObsidianDrop 1.7.0 · 交付说明 · 2026-11-05 · 与 <code>docs/设计-1.7.0.md</code> A/B/C 规格一致<br>
-  安装包 <code>dist/ObsidianDrop-1.7.0.dmg</code>（约 1.5 MB，build 22 新图标）· SHA256 见同目录 <code>.sha256</code> 文件与交付消息<br>
+  安装包 <code>dist/ObsidianDrop-1.7.0.dmg</code>（约 1.5 MB，build 23）· SHA256 见同目录 <code>.sha256</code> 文件与交付消息<br>
   （校验值在打包后才会产生，故不写死在说明页里，避免页内值与安装包自相矛盾）· 源码与验证材料见仓库根目录
 </footer>
 
