@@ -2016,18 +2016,21 @@ final class SpeechRunner {
         }
         // 收尾要多久取决于「系统里还积压多少音频」，跟录音长度成正比：
         // 实测 3 分钟音频 5.5 秒、48 分钟音频 90 秒上下。给 20 分之一并留 15 秒底线。
-        let finalizeLimit = min(max(15.0, seconds / 20.0), 180.0)
+        // 录音不限时长后上限放到 900s：旧 180s 只够约 1 小时音频，半天会议会截尾。
+        let finalizeLimit = min(max(15.0, seconds / 20.0), 900.0)
         let finalizeOK = await runWithTimeout(seconds: finalizeLimit) {
             try? await analyzer.finalizeAndFinishThroughEndOfInput()
         }
         DiagLog.write("收尾：用时 \(String(format: "%.1f", Date().timeIntervalSince(finStart)))s"
                       + "（限 \(Int(finalizeLimit))s），" + (finalizeOK ? "正常" : "超时") + "，字数 \(box.count)")
         if !finalizeOK { NSLog("ObsidianDrop: 文件转写收尾超时（\(Int(finalizeLimit))s），返回已识别内容") }
-        let drainOK = await runWithTimeout(seconds: 5) { _ = await collector.value }
+        // 结果流收尾同样跟着音频长度放宽，长录音最后一批结果才不会被丢掉
+        let drainLimit = min(max(5.0, seconds / 120.0), 120.0)
+        let drainOK = await runWithTimeout(seconds: drainLimit) { _ = await collector.value }
         if !drainOK {
             // 收尾都结束了结果流还没走完：后面这批结果就是「已经识别出来但没读走」，
             // 不说出来，下次还会被当成丢字去查引擎。
-            DiagLog.write("注意：结果流 5 秒内没有收完（collector 超时），可能有结果没被读走")
+            DiagLog.write("注意：结果流 \(Int(drainLimit)) 秒内没有收完（collector 超时），可能有结果没被读走")
         }
         finTicker.cancel()
 
