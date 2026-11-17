@@ -637,7 +637,9 @@ final class Filer {
     /// 不能出现「这次没摘要、上次有」的随机差异。
     func memo(text: String, target rel: String, duration: TimeInterval, engine: String,
               ai: AIResult? = nil, aiState: AIState = .off,
-              sceneResult: AISceneResult? = nil) throws -> DropOutcome {
+              sceneResult: AISceneResult? = nil,
+              recording: RecordingArchive.Outcome? = nil,
+              transcriptIncomplete: Bool = false) throws -> DropOutcome {
         guard fm.fileExists(atPath: vault.path) else { throw FilerError.vaultMissing(vault.path) }
 
         let noteDirRaw = try VaultGuard.resolve(target: rel, vault: vault)
@@ -683,7 +685,7 @@ final class Filer {
         时长: \(dur)
         目标: \(rel)
         转写: 端上本机（\(engine)）
-        \(aiFrontMatter(ai, state: aiState, hasPolish: hasPolish))tags:
+        \(recordingFrontMatter(recording, incomplete: transcriptIncomplete))\(aiFrontMatter(ai, state: aiState, hasPolish: hasPolish))tags:
         \(Filer.yamlTags(["灵感", target.tag] + (ai?.tags ?? [])))
         ---
 
@@ -695,7 +697,7 @@ final class Filer {
         > - 时长：\(dur)
         > - 转写：Mac 本机完成，未上传云端
         \(aiLine(ai, state: aiState, hasPolish: hasPolish))> - 由 ObsidianDrop 于 \(stamp) 录在「\(rel)」
-
+        \(recordingLine(recording, incomplete: transcriptIncomplete))
         """
         let published = try ExclusiveNoteWriter.publish(text: body, dir: noteDir,
                                                         base: noteBaseName)
@@ -718,6 +720,37 @@ final class Filer {
         }
         while out.last?.isEmpty == true { out.removeLast() }
         return out.joined(separator: "\n")
+    }
+
+    /// 原文件已入库时，把路径写进 frontmatter，便于按录音筛笔记。
+    ///
+    /// `转写完整: false` 只在收尾没跑到末尾时写——这是「录音不全」那次教训：
+    /// 超时被静默吞掉，用户拿到笔记无从判断最后一段到底是没说还是没识别出来。
+    private func recordingFrontMatter(_ r: RecordingArchive.Outcome?,
+                                      incomplete: Bool) -> String {
+        var s = ""
+        if let r {
+            s += "录音: \"[[\(r.relPath)]]\"\n"
+            s += "录音大小: \(RecordingArchive.mb(r.bytes))\n"
+        }
+        if incomplete { s += "转写完整: false\n" }
+        return s
+    }
+
+    /// 「录制信息」里的一行，点一下就能回听或拿去重新转写。
+    private func recordingLine(_ r: RecordingArchive.Outcome?,
+                               incomplete: Bool) -> String {
+        guard let r else {
+            return incomplete
+                ? "> - 原文件未保存（转换失败，原始录音已保留在本地）；识别结果可能不完整"
+                : ""
+        }
+        var line = "> - 录音原文件：[[\(r.relPath)|打开（\(Memo.clock(r.seconds))，\(RecordingArchive.mb(r.bytes))）]]"
+        if incomplete {
+            line += "\n> - ⚠️ 本次识别没有覆盖到音频末尾，上面的文字可能缺最后一段；"
+                + "可用上面这个原文件重新转写"
+        }
+        return line
     }
 
     /// 只有**真的处理过**才写这两行。跳过/未启用时写「AI: 跳过」会让笔记里
@@ -860,6 +893,9 @@ struct MemoOutcome {
     var writeErrors: Int = 0
     /// 录音没完整落盘：转写内容可能缺一截，界面必须说清楚（build 25）
     var incompleteRecording: Bool { writeErrors > 0 }
+    /// 识别没覆盖到音频末尾（收尾或结果流被超时取消）。
+    /// 与 `incompleteRecording` 是两码事：前者是「音频没了」，这里是「音频在、字没读完」。
+    var transcriptIncomplete: Bool = false
     /// 是否来自音频文件（而不是现场录音）
     var fromFile: Bool = false
     /// 录音原始文件（1.3.11 起：录音先落盘再按文件转写，失败时这个文件还在）
@@ -1936,7 +1972,7 @@ final class SpeechRunner {
     /// `analyzeSequence` 是「处理完整个序列才返回」，本身带背压，从根上避免这个问题。
     static func transcribeFile(at url: URL,
                                localeID: String,
-                               progress: @escaping (TranscribeProgress) -> Void = { _ in }) async throws -> (text: String, seconds: Double) {
+                               progress: @escaping (TranscribeProgress) -> Void = { _ in }) async throws -> (text: String, seconds: Double, incomplete: Bool) {
         let (transcriber, analyzer) = try await prepare(localeID: localeID, progress: progress)
 
         let opened = try openAudio(url)
@@ -1956,12 +1992,16 @@ final class SpeechRunner {
             percent: 0, processed: 0, total: seconds, chars: 0))
 
         let box = TextBox()
+        // 结果流的错误必须单独记：`catch` 之后 Task 正常返回，只看 `drainOK`
+        // 会把「结果流报错中断」当成「读完了」，于是失败被报成完整。
+        let collectorError = OSAllocatedUnfairLock<String?>(initialState: nil)
         let collector = Task.detached {
             do {
                 for try await r in transcriber.results {
                     box.push(String(r.text.characters), isFinal: r.isFinal, range: r.range)
                 }
             } catch {
+                collectorError.withLock { $0 = error.localizedDescription }
                 NSLog("ObsidianDrop: 文件转写结果流结束 \(error)")
             }
         }
@@ -2018,18 +2058,28 @@ final class SpeechRunner {
                                     waited: Date().timeIntervalSince(finStart)))
             }
         }
-        // 收尾要多久取决于「系统里还积压多少音频」，跟录音长度成正比：
-        // 实测 3 分钟音频 5.5 秒、48 分钟音频 90 秒上下。给 20 分之一并留 15 秒底线。
-        // 录音不限时长后上限放到 900s：旧 180s 只够约 1 小时音频，半天会议会截尾。
-        let finalizeLimit = min(max(15.0, seconds / 20.0), 900.0)
+        // 收尾上限 = 「最多容忍多久」，不是「预测需要多久」。
+        // 旧值 seconds/20 与真实需要量没有因果关系：收尾耗时取决于
+        // 「喂入速度 vs 识别速度」造成的积压——本机喂 536s 音频只用 10s，
+        // 积压极多，收尾要 26s 以上，两次都撞上限被 cancel，尾部结果直接丢
+        // （同一文件跑两次，覆盖 100% 与 87%）。改成最坏情况给到实时时长。
+        let finalizeLimit = min(max(60.0, seconds), 1800.0)
+        let finError = OSAllocatedUnfairLock<String?>(initialState: nil)
         let finalizeOK = await runWithTimeout(seconds: finalizeLimit) {
-            try? await analyzer.finalizeAndFinishThroughEndOfInput()
+            do {
+                try await analyzer.finalizeAndFinishThroughEndOfInput()
+            } catch {
+                // `try?` 会把收尾异常吞掉，任务看起来「正常结束」——必须单独记下来
+                finError.withLock { $0 = error.localizedDescription }
+            }
         }
         DiagLog.write("收尾：用时 \(String(format: "%.1f", Date().timeIntervalSince(finStart)))s"
                       + "（限 \(Int(finalizeLimit))s），" + (finalizeOK ? "正常" : "超时") + "，字数 \(box.count)")
         if !finalizeOK { NSLog("ObsidianDrop: 文件转写收尾超时（\(Int(finalizeLimit))s），返回已识别内容") }
         // 结果流收尾同样跟着音频长度放宽，长录音最后一批结果才不会被丢掉
-        let drainLimit = min(max(5.0, seconds / 120.0), 120.0)
+        // 结果流收尾同样按「最多容忍」给：收尾结束后还要把积压的结果读走，
+        // 这一段的量级与 finalize 同源，给得太紧等于前功尽弃。
+        let drainLimit = min(max(30.0, seconds * 0.2), 600.0)
         let drainOK = await runWithTimeout(seconds: drainLimit) { _ = await collector.value }
         if !drainOK {
             // 收尾都结束了结果流还没走完：后面这批结果就是「已经识别出来但没读走」，
@@ -2054,7 +2104,25 @@ final class SpeechRunner {
                           + "拿一段有人工逐字稿的音频跑 --transcribe 对照即可确认")
         }
         NSLog("ObsidianDrop: 文件转写完成，音频 \(Int(seconds))s，产出 \(text.count) 字，覆盖 \(pct)%")
-        return (text, seconds)
+        // 「没跑完」必须往外传：以前超时是静默的，界面上照旧显示「已归档」，
+        // 用户拿到笔记永远不知道最后一段可能没识别（1.7.0 的「录音不全」反馈）。
+        // 只把「收尾/结果流被取消」算不完整；覆盖度低不算——那是静音，不是故障。
+        // 只有「analyze / finalize / 结果流 三条链路都正常收尾」才算完整。
+        //
+        // 覆盖率**不参与**这个判定：音频尾部可能是静音或环境音，覆盖不满并不等于丢字；
+        // 反过来覆盖到 99% 也不能证明后续不会再有结果。覆盖率只用来诊断。
+        let cErr = collectorError.withLock { $0 }
+        let fErr = finError.withLock { $0 }
+        let incomplete = !analyzeOK || !finalizeOK || !drainOK || cErr != nil || fErr != nil
+        if incomplete {
+            DiagLog.write("注意：本次转写未能确认读到底（analyze \(analyzeOK ? "完成" : "超时")"
+                          + "，finalize \(finalizeOK ? "完成" : "超时")"
+                          + "，结果流 \(drainOK ? "读完" : "超时")"
+                          + (cErr.map { "，结果流错误 \($0)" } ?? "")
+                          + (fErr.map { "，收尾错误 \($0)" } ?? "")
+                          + "），笔记将标注「转写完整: false」")
+        }
+        return (text, seconds, incomplete)
     }
 
     /// 已处理到音频的哪一秒。优先读分析器的 volatileRange（精确），
@@ -2352,6 +2420,35 @@ final class RecordingStore: @unchecked Sendable {
         format = nil
     }
 
+    /// 关文件前先等在途的最后一块落盘。
+    ///
+    /// `removeTap` 返回时，正在执行的那次 tap 回调可能还没进 `append`；
+    /// 直接 `close()` 会被 `closed` 守卫挡掉那一块（4096 帧 ≈ 85ms）。
+    /// 用「已写帧数静止」判断在途写入结束，最多等 120ms——正常两三个采样点就稳定，
+    /// 主线程不会被明显拖住。注意**不能**在 tap 回调里做这个等待，会堵音频线程。
+    func drainedClose(timeout: Double = 0.12) {
+        let deadline = Date().addingTimeInterval(timeout)
+        var last: AVAudioFramePosition = -1
+        var stableTicks = 0
+        while Date() < deadline {
+            let now = lockedFrames()
+            if now == last {
+                stableTicks += 1
+                if stableTicks >= 2 { break }
+            } else {
+                stableTicks = 0
+                last = now
+            }
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        close()
+    }
+
+    private func lockedFrames() -> AVAudioFramePosition {
+        lock.lock(); defer { lock.unlock() }
+        return frames
+    }
+
     /// 文件里实际有多少秒（按写入帧数算，比墙钟更准）。关文件后依然可用。
     var seconds: Double {
         lock.lock()
@@ -2403,6 +2500,20 @@ struct PendingMemo: Codable {
     var source: String          // "record" / "file"
     var createdAt: Date
     var attempts: Int
+
+    /// 1.7.1：识别是否覆盖到音频末尾。
+    /// 可选是为了让旧 pending 照常解码——缺键时视为「完整」（旧版收尾超时是静默的，
+    /// 那时没有任何依据判断，按完整处理不会凭空给老笔记加警告）。
+    var transcriptIncomplete: Bool?
+
+    var transcriptComplete: Bool { transcriptIncomplete != true }
+
+    /// 库内永久录音的相对路径。
+    ///
+    /// 与 `audioPath` 严格分开：`audioPath` 是临时 caf，转码成功后要删；
+    /// 这个是永久副本，**任何清理路径都不许碰它**。合用一个字段的后果是
+    /// 「笔记一归档，刚存的录音就被删了」。
+    var retainedAudioRel: String?
 
     // 1.5.0：AI 前置处理的结果跟着 pending 一起落盘。
     // 用可选而不是给默认值，是为了让**旧版写下的 pending 文件**照常解码——
@@ -2635,9 +2746,16 @@ enum MemoArchiveQueue {
 
             // 上次「笔记写完、pending 还没删」时中断了：这篇已经在库里，只做清理。
             if let rel = ArchiveMarker.doneRel(id: m.id) {
+                // 笔记已经在库里了。录音要不要删，取决于它是否已经永久入库——
+                // 只看 audioPath 非空就删，会把「还没转码的原文件」一起清掉，
+                // 而那时它已经是唯一副本。
+                if let kept = m.retainedAudioRel, !kept.isEmpty, !m.audioPath.isEmpty {
+                    try? FileManager.default.removeItem(atPath: m.audioPath)
+                } else if !m.audioPath.isEmpty {
+                    DiagLog.write("重复归档清理：原始录音未入库，保留 \(m.audioPath)")
+                }
                 PendingStore.remove(id: m.id)
                 ArchiveMarker.clear(id: m.id)
-                if !m.audioPath.isEmpty { try? FileManager.default.removeItem(atPath: m.audioPath) }
                 DiagLog.write("跳过重复归档：\(m.id) 已写入 \(rel)（上次在删 pending 前中断）")
                 return nil
             }
@@ -2724,11 +2842,45 @@ enum MemoArchiveQueue {
                 }
             }
 
+            // 录音原文件先转码落库，再写笔记——笔记里要带原文件链接。
+            //
+            // 顺序必须是「转码成功 → 写入笔记 → 删 caf」。反了就等于「删完才发现没存成」，
+            // 1.3.13 的丢数据就是这么来的。转换失败也绝不阻断笔记：文字才是主产物，
+            // caf 原样留在 recordings 目录，等补转或人工处理。
+            var recording: RecordingArchive.Outcome?
+            if m.source == "record" {
+                let vaultURL = URL(fileURLWithPath: m.vaultPath.isEmpty ? Cfg.vault.path : m.vaultPath)
+                // 幂等：上次「转码成功、笔记没写成」时，库内那份还在，直接复用。
+                // 不这样做的话每次补归档都会多转一份，录音文件越堆越多。
+                if let rel = m.retainedAudioRel,
+                   let existing = RecordingArchive.existing(rel: rel, vault: vaultURL) {
+                    recording = existing
+                    DiagLog.write("原文件已在库内，跳过重复转码：\(rel)")
+                } else if !m.audioPath.isEmpty {
+                    do {
+                        let r = try RecordingArchive.export(caf: URL(fileURLWithPath: m.audioPath),
+                                                            vault: vaultURL, at: m.createdAt)
+                        recording = r
+                        // 转码成功立刻回写 pending：后面写笔记失败或进程崩掉，
+                        // 下次补归档看到这个字段就知道不用再转一遍
+                        memo.retainedAudioRel = r.relPath
+                        try? PendingStore.enqueue(memo)
+                        DiagLog.write("原文件已入库：\(r.relPath)"
+                                      + "（\(RecordingArchive.mb(r.bytes))，\(Memo.clock(r.seconds))）")
+                    } catch {
+                        DiagLog.write("原文件入库失败：\(error.localizedDescription)"
+                                      + "（原始录音保留：\(m.audioPath)）")
+                    }
+                }
+            }
+
             let out = try Filer(vault: m.vault).memo(text: m.text, target: m.target,
                                                      duration: m.duration, engine: m.engine,
                                                      ai: hasAIResult ? aiResult : nil,
                                                      aiState: aiState,
-                                                     sceneResult: sceneResult)
+                                                     sceneResult: sceneResult,
+                                                     recording: recording,
+                                                     transcriptIncomplete: !m.transcriptComplete)
             // **先确认笔记写成功，再删 pending 和录音**。
             // 顺序反了就等于「删完才发现没写成」——1.3.13 的丢数据正是这么来的。
             // 中间再加一道 done 标记：删 pending 之前崩溃时，补归档不会重复写第二篇。
@@ -2743,7 +2895,17 @@ enum MemoArchiveQueue {
             if !marked {
                 DiagLog.write("完成标记写入失败：\(m.id)——此刻崩溃会重复写一篇")
             }
-            if !m.audioPath.isEmpty { try? FileManager.default.removeItem(atPath: m.audioPath) }
+            // 只有「原文件确认入库」才删 caf。转换失败时它是唯一副本，必须留着。
+            // 用户自己拖进来的音频（source == "file"）一律不动。
+            if !m.audioPath.isEmpty {
+                if m.source == "record" {
+                    if recording != nil {
+                        try? FileManager.default.removeItem(atPath: m.audioPath)
+                    } else {
+                        DiagLog.write("原始录音保留：\(m.audioPath)（原文件转换失败，可手动重试）")
+                    }
+                }
+            }
 
             // 埋点也放在这个唯一出口：界面、看门狗、启动补归档都从这里走，
             // 因此每条只会计一次，且不依赖界面是否还活着。
@@ -2965,7 +3127,8 @@ final class MemoSession {
             return
         }
         self.store = nil
-        store.close()
+        // 等在途的最后一块落盘再关文件：removeTap 返回时那次 tap 回调可能还没进 append
+        store.drainedClose()
 
         let recorded = store.seconds
         let peak = readPeak()
@@ -3020,6 +3183,7 @@ final class MemoSession {
                 o.peak = peak
                 o.broken = errors > 0
                 o.writeErrors = errors
+                o.transcriptIncomplete = r.incomplete
                 // 录音**一律留着**，等笔记真正写成功再由归档环节删。
                 // 1.3.13 在这里就 `store.discard()`，紧接着才投递结果——
                 // 投递一失败，文字和录音就同时没了。先落盘、先保命。
@@ -5934,7 +6098,8 @@ extension AppDelegate: MemoSink {
                                 audioPath: memoFromFile ? "" : outcome.recordingPath,
                                 source: memoFromFile ? "file" : "record",
                                 createdAt: Date(),
-                                attempts: 0)
+                                attempts: 0,
+                                transcriptIncomplete: outcome.transcriptIncomplete)
             item = m
             if (try? PendingStore.enqueue(m)) == nil {
                 DiagLog.round(run, "待归档落盘失败，直接归档（不经过队列，仍先写笔记后删录音）")
@@ -6979,6 +7144,69 @@ enum SelfTest {
             } catch { acceptedNormalPolish = false }
             check("只去口头禅、保留关键项的润色仍允许", acceptedNormalPolish)
 
+            // 1.7.1：录音原文件入库 + 笔记留痕
+            do {
+                // 造一段 2 秒 caf（44.1k 单声道），模拟设备原生录音
+                let srcCaf = vault.appendingPathComponent("selftest-rec.caf")
+                try? FileManager.default.removeItem(at: srcCaf)
+                let srcFmt = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 1)!
+                var writer: AVAudioFile? = try AVAudioFile(forWriting: srcCaf,
+                                                           settings: srcFmt.settings)
+                let srcBuf = AVAudioPCMBuffer(pcmFormat: srcFmt, frameCapacity: 88200)!
+                srcBuf.frameLength = 88200
+                let samples = srcBuf.floatChannelData![0]
+                for i in 0..<Int(srcBuf.frameLength) {
+                    samples[i] = sinf(Float(i) * 0.05) * 0.3
+                }
+                try writer?.write(from: srcBuf)
+                writer = nil   // 必须先释放句柄再读
+
+                let rec = try RecordingArchive.export(caf: srcCaf, vault: vault, at: Date())
+                check("原文件转码落库：路径在 附件/录音/ 下",
+                      rec.relPath.hasPrefix("附件/录音/") && rec.relPath.hasSuffix(".m4a"),
+                      rec.relPath)
+                check("原文件转码落库：文件真实存在且非空",
+                      FileManager.default.fileExists(atPath: rec.url.path) && rec.bytes > 1024,
+                      "\(rec.bytes) 字节")
+                check("原文件转码落库：时长误差 < 0.5s",
+                      abs(rec.seconds - 2.0) < 0.5,
+                      String(format: "%.2fs", rec.seconds))
+                // 2 秒 AAC 24kbps ≈ 6 KB，给 64 KB 上限足够宽松又拦得住「写成了无损」
+                check("原文件转码落库：体积符合 AAC 压缩特征",
+                      rec.bytes < 64 * 1024, "\(rec.bytes) 字节")
+
+                check("原文件幂等：已入库的能直接复用",
+                      RecordingArchive.existing(rel: rec.relPath, vault: vault) != nil)
+                check("原文件幂等：不存在的路径返回 nil",
+                      RecordingArchive.existing(rel: "附件/录音/2000-01/nope.m4a", vault: vault) == nil)
+
+                let note = try Filer(vault: vault).memo(text: "自检用的两秒录音内容",
+                                                        target: "90-自检/录音",
+                                                        duration: rec.seconds, engine: "selftest",
+                                                        recording: rec,
+                                                        transcriptIncomplete: true)
+                let noteText = (try? String(contentsOf: vault.appendingPathComponent(note.noteRel),
+                                            encoding: .utf8)) ?? ""
+                check("笔记 frontmatter 带录音链接",
+                      noteText.contains("录音: \"[[\(rec.relPath)]]\"")
+                        && noteText.contains("录音大小:"))
+                check("不完整转写在 frontmatter 留痕",
+                      noteText.contains("转写完整: false"))
+                check("正文给出可点击的原文件入口",
+                      noteText.contains("录音原文件：[[\(rec.relPath)|打开"))
+
+                // 不带录音、且转写完整时，不能多出任何相关行（旧行为逐字保持）
+                let plain = try Filer(vault: vault).memo(text: "没有录音的普通灵感",
+                                                         target: "90-自检/录音",
+                                                         duration: 1, engine: "selftest")
+                let plainText = (try? String(contentsOf: vault.appendingPathComponent(plain.noteRel),
+                                             encoding: .utf8)) ?? ""
+                check("无原文件时不写录音字段",
+                      !plainText.contains("录音:") && !plainText.contains("转写完整:"))
+            } catch {
+                check("原文件入库用例可执行", false, error.localizedDescription)
+            }
+
             // 第二轮复核：--target 是 1.6.0 旧用法共用的参数，不能算「场景标志」。
             check("1.6.0 旧 --ai-run <文字> 仍走 AICLI",
                   SceneCLI.isLegacyAIUsage(["--ai-run", "一段文字"]))
@@ -7031,6 +7259,58 @@ enum SelfTest {
             check("AI 关闭时文件笔记不含 1.7 新字段",
                   note?.contains("AI场景") == false && note?.contains("摘要:") == false
                     && note?.contains("类型: 文件归档") == true)
+
+            // 1.7.1：完整归档链路——先转码入库，再写笔记，最后才删临时 caf。
+            // 顺序反了就是「删完才发现没存成」，这条断言专门守它。
+            do {
+                let caf = t.appendingPathComponent("selftest-chain.caf")
+                try? FileManager.default.removeItem(at: caf)
+                let f0 = AVAudioFormat(standardFormatWithSampleRate: 48000, channels: 1)!
+                var w: AVAudioFile? = try AVAudioFile(forWriting: caf, settings: f0.settings)
+                let b0 = AVAudioPCMBuffer(pcmFormat: f0, frameCapacity: 48000)!
+                b0.frameLength = 48000
+                for i in 0..<48000 { b0.floatChannelData![0][i] = sinf(Float(i) * 0.04) * 0.25 }
+                try w?.write(from: b0)
+                w = nil
+
+                var off2 = AIConfig(); off2.enabled = false
+                AIConfigStore.overrideConfig = off2
+                let pm = PendingMemo(id: UUID().uuidString,
+                                     text: "归档链路自检：这是一段用来验证录音入库顺序的测试文字",
+                                     duration: 1, target: "90-自检/链路",
+                                     vaultPath: t.path, engine: "selftest",
+                                     audioPath: caf.path, source: "record",
+                                     createdAt: Date(), attempts: 0,
+                                     transcriptIncomplete: false)
+                try PendingStore.enqueue(pm)
+                let archived = try? MemoArchiveQueue.archive(pm)
+                AIConfigStore.overrideConfig = nil
+
+                check("归档链路：笔记写出来了", archived != nil && archived?.noteRel.isEmpty == false)
+                check("归档链路：临时 caf 在成功后清理",
+                      !FileManager.default.fileExists(atPath: caf.path))
+
+                // 库内按月分目录，递归找一遍
+                var found: [String] = []
+                if let en = FileManager.default.enumerator(atPath:
+                        t.appendingPathComponent("附件/录音").path) {
+                    for case let p as String in en where p.hasSuffix(".m4a") { found.append(p) }
+                }
+                check("归档链路：库内留有 m4a", !found.isEmpty, "\(found.count) 个")
+                let noteBody = archived.flatMap {
+                    try? String(contentsOf: t.appendingPathComponent($0.noteRel), encoding: .utf8)
+                } ?? ""
+                let hasFmLink = noteBody.contains(#"录音: "[[附件/录音/"#)
+                let hasBodyLink = noteBody.contains("录音原文件：[[")
+                check("归档链路：笔记里带录音链接", hasFmLink && hasBodyLink)
+                check("归档链路：完整转写不写 false",
+                      !noteBody.contains("转写完整: false"))
+                check("归档链路：pending 已清理",
+                      PendingStore.load(id: pm.id) == nil)
+            } catch {
+                check("归档链路用例可执行", false, error.localizedDescription)
+            }
+
 
             // A6.3 / A6.4：transcript 成功的 AI 行是单个 YAML 标量；
             // 旧 done pending 没有润色稿，必须逐字保持 1.6.0，不升级模板。

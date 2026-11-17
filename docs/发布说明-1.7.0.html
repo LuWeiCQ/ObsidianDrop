@@ -67,7 +67,7 @@
   <h1>ObsidianDrop 1.7.0<br>AI 分场景，面板重做，补上图标</h1>
   <div class="sub">文件做摘要 · 转录润色分段改错病语 · 截图识别画面 · 其他类型照旧 · 下拉面板 400×520 · App / 菜单栏 ICON。仍是零依赖、单二进制、只新建笔记。</div>
   <div class="badges">
-    <span class="badge ok">自检 209 / 209</span>
+    <span class="badge ok">自检 225 / 225</span>
     <span class="badge ok">回归 56 / 56</span>
     <span class="badge ok">E2E 六例通过</span>
     <span class="badge">macOS 13+ / arm64</span>
@@ -172,7 +172,7 @@ $ /usr/bin/plutil -lint …/Info.plist           OK
 $ /usr/bin/iconutil -c iconset …/AppIcon.icns  10 个档位
 
 $ ObsidianDrop --self-test
-自检结果：通过 209，失败 0
+自检结果：通过 225，失败 0
 
 $ bash scripts/regression.sh
 回归结果：通过 56，失败 0
@@ -232,7 +232,37 @@ runProcess 超限   12 MiB 假 XLSX → 0.18s 降级 legacy，无挂起、无无
   <li>转写收尾超时按音频长度放宽：finalize 上限 180s → <strong>900s</strong>，结果流 5s → <strong>120s</strong>；<strong>录音与文件转写两条路径都改了</strong>（录音结束实际走 <code>transcribeFile</code>，只改实时转写那条等于没改），否则超长录音的尾巴会被截掉。</li>
   <li>录音写入失败不再静默：以前只把次数写进日志，界面照样显示「灵感已归档」。现在归档后会明确提示「有 N 段没写进去」并给出录音文件路径——不限时长后一次录音可能几百 MB，磁盘写满的概率不再可以忽略。</li>
 </ul>
-<p>自检新增 4 条断言（不设上限、h:mm:ss、1 小时内仍 m:ss、写失败标记），总数 205 → <strong>209</strong>。录音文件的写入本身是流式的，不受时长影响；按实测 362.4 秒 / 31.97 MB 折算约 300 MB/小时（16 kHz / 16 bit / 单声道），转写成功即删。</p>
+<p>自检新增 4 条断言（不设上限、h:mm:ss、1 小时内仍 m:ss、写失败标记），总数 205 → <strong>209</strong>。录音文件的写入本身是流式的，不受时长影响；按实测 362.4 秒 / 31.97 MB 折算约 300 MB/小时（16 kHz / 16 bit / 单声道），转码入库后删临时 caf。</p>
+
+<h2>5.3 录音「不全」根因修复 + 原文件保存（build 26）</h2>
+<p>用户在 MacBook 上录了 60 分钟，反馈「录音不全，结尾少了一截」。查下来<strong>录音本身是完整的</strong>：墙钟 3624.7s、文件 3624.5s、664 MB、写失败 0 次。丢的是转写结果——只产出 5914 字、覆盖 84%、最长连续空白 234.7 秒。</p>
+<p><strong>根因</strong>：<code>finalizeLimit</code> 用的是 <code>秒数/20</code>，而收尾耗时取决于「喂入速度与识别速度的差额」造成的积压，与音频长度没有这个比例关系。本机复现：</p>
+<table>
+  <tr><th>样本</th><th>收尾上限</th><th>实际收尾</th><th>结果</th><th>覆盖</th></tr>
+  <tr><td>536.5s 第 1 次</td><td>26s</td><td>26.8s</td><td><strong>超时被取消</strong></td><td>100%</td></tr>
+  <tr><td>536.5s 第 2 次</td><td>26s</td><td>26.8s</td><td><strong>超时被取消</strong></td><td><strong>87%</strong></td></tr>
+  <tr><td>536.5s（改后）×3</td><td>536s</td><td>33.1–33.7s</td><td>正常</td><td>100% ×3</td></tr>
+  <tr><td>3759.5s</td><td>187s</td><td>181.9s</td><td>贴着上限</td><td>99%</td></tr>
+</table>
+<p>同一文件两次跑出 100% 与 87%，就是因为真实需要 33 秒、上限只有 26 秒，超时后 <code>runWithTimeout</code> 会 <code>cancel()</code> 掉收尾任务，剩余结果不再吐出。</p>
+<ul>
+  <li>上限改为「最多容忍多久」：<code>min(max(60, 秒数), 1800)</code>；结果流同步放到 <code>min(max(30, 秒数×0.2), 600)</code></li>
+  <li>完成判据改为「analyze / finalize / 结果流三条链路都正常收尾」；结果流异常和收尾异常不再被 <code>catch</code>、<code>try?</code> 吞掉后当成成功</li>
+  <li>覆盖率<strong>不参与</strong>完整判定——尾部静音会让覆盖不满，覆盖到 99% 也不代表结果不会再来；它只用于诊断</li>
+  <li>不完整时写 <code>转写完整: false</code>，正文追加提示行，日志写清是哪条链路的问题</li>
+  <li>录音结束改用 <code>drainedClose()</code>：先等已写帧数静止再关文件，在途最后一块不再被丢弃</li>
+</ul>
+<p><strong>录音原文件保存</strong>（这是能复核「到底缺没缺」的唯一依据，以前转写完就删了）：</p>
+<ul>
+  <li>位置 <code>附件/录音/YYYY-MM/yyyyMMdd-HHmmss-灵感.m4a</code>，AAC 16 kHz 单声道 24 kbps，约 <strong>10.9 MB/小时</strong>（原始 caf 约 664 MB/小时）</li>
+  <li>实测转换 1440× 实时、时长误差 0.00s；四种编码各跑一次的字数落在 1962–2152（±4.6%），<strong>压缩没有额外识别损失</strong></li>
+  <li>先写临时件、校验时长与可播放性再搬进库；同卷原子 move，跨卷复制后比对大小</li>
+  <li>永久路径 <code>retainedAudioRel</code> 与临时 <code>audioPath</code> 严格分开，归档清理不会删永久副本；补归档重跑时复用已入库的录音，不重复转码</li>
+  <li>转换失败或磁盘不足时保留 caf 并提示路径，笔记照常写入</li>
+</ul>
+<p>自检 209 → <strong>225</strong> 项（新增转码落库、幂等复用、frontmatter 留痕、完整链路顺序共 16 条）。</p>
+<p class="muted">build 26 最终二进制 SHA256 <code>52f092479d0d3fc4a7cc5542446a74d5b7ba7165c204b74df69c211c32a7059a</code>；
+自检 225/225、回归 56/56。</p>
 
 <h2>6 已知限制</h2>
 <ul>
