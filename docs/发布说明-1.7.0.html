@@ -254,14 +254,15 @@ runProcess 超限   12 MiB 假 XLSX → 0.18s 降级 legacy，无挂起、无无
 </ul>
 <p><strong>录音原文件保存</strong>（这是能复核「到底缺没缺」的唯一依据，以前转写完就删了）：</p>
 <ul>
-  <li>位置 <code>附件/录音/YYYY-MM/yyyyMMdd-HHmmss-灵感.m4a</code>，AAC 16 kHz 单声道 24 kbps，约 <strong>10.9 MB/小时</strong>（原始 caf 约 664 MB/小时）</li>
-  <li>实测转换 1440× 实时、时长误差 0.00s；四种编码各跑一次的字数落在 1962–2152（±4.6%），<strong>压缩没有额外识别损失</strong></li>
+  <li>位置 <code>附件/录音/YYYY-MM/yyyyMMdd-HHmmss-灵感.m4a</code>，AAC 单声道 <strong>48 kbps</strong>（保留源采样率），约 <strong>21 MB/小时</strong>（原始 caf 约 664 MB/小时）</li>
+  <li>实测转换 1440× 实时、时长误差 0.00s</li>
+  <li>码率是实测定的，不是拍的：同一段 536.5s 语音各跑 3 次，原文件稳定 2152 字；16 kHz/24 kbps 稳定 1962 字（<strong>-8.8%</strong>）；48 kbps 是 2142 字（<strong>-0.5%</strong>）。为省一半空间丢掉近一成的字不划算，所以选了后者</li>
   <li>先写临时件、校验时长与可播放性再搬进库；同卷原子 move，跨卷复制后比对大小</li>
   <li>永久路径 <code>retainedAudioRel</code> 与临时 <code>audioPath</code> 严格分开，归档清理不会删永久副本；补归档重跑时复用已入库的录音，不重复转码</li>
   <li>转换失败或磁盘不足时保留 caf 并提示路径，笔记照常写入</li>
 </ul>
 <p>自检 209 → <strong>225</strong> 项（新增转码落库、幂等复用、frontmatter 留痕、完整链路顺序共 16 条）。</p>
-<p class="muted">build 26 最终二进制 SHA256 <code>52f092479d0d3fc4a7cc5542446a74d5b7ba7165c204b74df69c211c32a7059a</code>；
+<p class="muted">build 26 最终二进制 SHA256 <code>3865e24f05acff9d3409e296ce9349e82ef8ba123ecae8fdf28761d94f6a7b5d</code>；
 自检 225/225、回归 56/56。</p>
 
 <h2>6 已知限制</h2>

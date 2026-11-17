@@ -741,8 +741,11 @@ final class Filer {
     private func recordingLine(_ r: RecordingArchive.Outcome?,
                                incomplete: Bool) -> String {
         guard let r else {
+            // 走到这里有两种情况：录音入口转换失败（caf 仍在本地），
+            // 或文件入口本来就不保存原文件（音频本来就是用户自己的）。
+            // 所以文案只讲「识别不完整」，不猜原文件在不在。
             return incomplete
-                ? "> - 原文件未保存（转换失败，原始录音已保留在本地）；识别结果可能不完整"
+                ? "> - ⚠️ 本次识别没有覆盖到音频末尾，上面的文字可能缺最后一段"
                 : ""
         }
         var line = "> - 录音原文件：[[\(r.relPath)|打开（\(Memo.clock(r.seconds))，\(RecordingArchive.mb(r.bytes))）]]"
@@ -5377,6 +5380,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                         source: "file",
                                         createdAt: Date(),
                                         attempts: 0,
+                                        transcriptIncomplete: r.incomplete,
                                         aiState: AIConfigStore.config.enabled ? .pending : nil)
                     if (try? PendingStore.enqueue(m)) != nil {
                         pendingID = m.id
@@ -5405,6 +5409,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     o.fromFile = true
                     o.pendingID = pendingID
                     o.recordingPath = url.path
+                    o.transcriptIncomplete = r.incomplete
                     self?.memoDone(text: r.text, duration: r.seconds, outcome: o, error: nil, run: run)
                 }
             } catch {
@@ -7171,7 +7176,7 @@ enum SelfTest {
                 check("原文件转码落库：时长误差 < 0.5s",
                       abs(rec.seconds - 2.0) < 0.5,
                       String(format: "%.2fs", rec.seconds))
-                // 2 秒 AAC 24kbps ≈ 6 KB，给 64 KB 上限足够宽松又拦得住「写成了无损」
+                // 2 秒 AAC 48 kbps ≈ 12 KB，给 64 KB 上限足够宽松又拦得住「写成了无损」
                 check("原文件转码落库：体积符合 AAC 压缩特征",
                       rec.bytes < 64 * 1024, "\(rec.bytes) 字节")
 

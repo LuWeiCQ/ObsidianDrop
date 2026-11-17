@@ -37,9 +37,13 @@ enum RecordingArchive {
         let bytes: Int64
     }
 
-    /// AAC-LC 16 kHz 单声道。语音识别够用，回听也清楚。
-    static let sampleRate: Double = 16000
-    static let bitRate = 24000
+    /// AAC-LC 单声道 48 kbps，**保留源采样率**（真机是 48 kHz）。
+    ///
+    /// 早期版本用 16 kHz / 24 kbps，体积只有一半，但实测掉 8.8% 的识别内容：
+    /// 同一段 536.5s 语音，原文件稳定出 2152 字，16k/24k 稳定出 1962 字（各跑 3 次）。
+    /// 改到 48 kbps 后是 2142 字（-0.5%），体积从 10.9 涨到约 21 MB/小时。
+    /// 这份文件的核心价值是「可重转写」，为省一半空间丢掉近一成的字不划算。
+    static let bitRate = 48000
 
     static func mb(_ bytes: Int64) -> String {
         String(format: "%.1f MB", Double(bytes) / 1024 / 1024)
@@ -177,9 +181,10 @@ enum RecordingArchive {
     /// `ExtAudioFileOpenURL` 失败（Code=1685348671）。所以这里用 optional 变量，
     /// 编码结束立刻置 nil，不依赖作用域结束时的 ARC 时机。
     private static func encode(src: AVAudioFile, to dstURL: URL) throws -> AVAudioFramePosition {
+        // 保留源采样率：刻意降到 16k 会额外丢字（实测 16k 无损 2047 字 vs 原文件 2152）
         let settings: [String: Any] = [
             AVFormatIDKey: kAudioFormatMPEG4AAC,
-            AVSampleRateKey: sampleRate,
+            AVSampleRateKey: src.processingFormat.sampleRate,
             AVNumberOfChannelsKey: 1,
             AVEncoderBitRateKey: bitRate,
         ]
