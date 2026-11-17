@@ -5673,16 +5673,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 以前只把次数写进日志和「0 字诊断」，正常归档时用户看到的是「灵感已归档」，
     /// 完全不知道后面一截音频根本没录上。不限时长后一次录音可能几百 MB，
     /// 磁盘写满的概率不再可以忽略。
+    /// 归档后提示「录音或转写不完整」。
+    ///
+    /// 两者必须分开说：录音不完整是**音频**缺了一截；转写不完整是**音频在、字没读完**。
+    /// 原来只处理前者，转写没跑完一律静默——用户反馈的「结尾少一截」就是这么被吞掉的。
     private func warnIncompleteRecording(_ o: MemoOutcome) {
-        guard o.incompleteRecording else { return }
-        let n = o.writeErrors
-        DiagLog.write("注意：本轮录音有 \(n) 段没写进文件，转写内容可能不完整")
-        dropView.flash("录音有 \(n) 段没写进去", ok: false)
+        guard o.incompleteRecording || o.transcriptIncomplete else { return }
+
+        var parts: [String] = []
+        if o.incompleteRecording {
+            let n = o.writeErrors
+            DiagLog.write("注意：本轮录音有 \(n) 段没写进文件，转写内容可能不完整")
+            dropView.flash("录音有 \(n) 段没写进去", ok: false)
+            parts.append("有 \(n) 段音频没写进文件（多半是磁盘空间不足或写入出错），转写内容可能缺一截。")
+        }
+        if o.transcriptIncomplete {
+            DiagLog.write("注意：本轮识别没有覆盖到音频末尾，笔记已标注「转写完整: false」")
+            if !o.incompleteRecording { dropView.flash("识别未跑完", ok: false) }
+            parts.append("本次识别没有跑到音频末尾，笔记最后一段可能不全。"
+                         + "笔记里已标注「转写完整: false」，录音原文件已存进库，可以用它重新转写。")
+        }
+        parts.append("已经识别出来的部分已入库。")
+
         let a = NSAlert()
-        a.messageText = "录音没有完整写入"
-        a.informativeText = "有 \(n) 段音频没写进文件（多半是磁盘空间不足或写入出错），"
-            + "转写内容可能缺一截；已经识别出来的部分已入库。\n\n"
-            + "录音文件：\(o.recordingPath.isEmpty ? "（未记录路径）" : o.recordingPath)"
+        a.messageText = o.incompleteRecording ? "录音没有完整写入" : "识别没有跑完"
+        a.informativeText = parts.joined(separator: "\n\n")
         a.alertStyle = .warning
         a.addButton(withTitle: "好")
         NSApp.activate(ignoringOtherApps: true)
