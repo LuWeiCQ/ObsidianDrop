@@ -67,7 +67,7 @@
   <h1>ObsidianDrop 1.7.0<br>AI 分场景，面板重做，补上图标</h1>
   <div class="sub">文件做摘要 · 转录润色分段改错病语 · 截图识别画面 · 其他类型照旧 · 下拉面板 400×520 · App / 菜单栏 ICON。仍是零依赖、单二进制、只新建笔记。</div>
   <div class="badges">
-    <span class="badge ok">自检 225 / 225</span>
+    <span class="badge ok">自检 227 / 227</span>
     <span class="badge ok">回归 56 / 56</span>
     <span class="badge ok">E2E 六例通过</span>
     <span class="badge">macOS 13+ / arm64</span>
@@ -172,7 +172,7 @@ $ /usr/bin/plutil -lint …/Info.plist           OK
 $ /usr/bin/iconutil -c iconset …/AppIcon.icns  10 个档位
 
 $ ObsidianDrop --self-test
-自检结果：通过 225，失败 0
+自检结果：通过 227，失败 0
 
 $ bash scripts/regression.sh
 回归结果：通过 56，失败 0
@@ -261,9 +261,9 @@ runProcess 超限   12 MiB 假 XLSX → 0.18s 降级 legacy，无挂起、无无
   <li>永久路径 <code>retainedAudioRel</code> 与临时 <code>audioPath</code> 严格分开，归档清理不会删永久副本；补归档重跑时复用已入库的录音，不重复转码</li>
   <li>转换失败或磁盘不足时保留 caf 并提示路径，笔记照常写入</li>
 </ul>
-<p>自检 209 → <strong>225</strong> 项（新增转码落库、幂等复用、frontmatter 留痕、完整链路顺序共 16 条）。</p>
-<p class="muted">build 26 最终二进制 SHA256 <code>bc36a87f11fe8b3124ebf9ef35cf7e1498f8d15533c4f82a672699b2e98c08d6</code>；
-自检 225/225、回归 56/56。</p>
+<p>自检 209 → <strong>227</strong> 项（新增转码落库、幂等复用、frontmatter 留痕、完整链路顺序、不完整标记持久化共 18 条）。</p>
+<p class="muted">build 26 最终二进制 SHA256 <code>1ac87e84e140230a8fca7c56939d0fcbd7ea0490e68275264c6f60c4c0264b98</code>；
+自检 227/227、回归 56/56。</p>
 
 <h2>6 已知限制</h2>
 <ul>

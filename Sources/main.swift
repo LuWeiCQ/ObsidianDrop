@@ -2867,7 +2867,14 @@ enum MemoArchiveQueue {
                         // 转码成功立刻回写 pending：后面写笔记失败或进程崩掉，
                         // 下次补归档看到这个字段就知道不用再转一遍
                         memo.retainedAudioRel = r.relPath
-                        try? PendingStore.enqueue(memo)
+                        do {
+                            try PendingStore.enqueue(memo)
+                        } catch {
+                            // 不阻断归档：最坏是下次补归档看不到这个字段、多转一份 m4a。
+                            // 但必须留痕，否则「越堆越多」永远查不出原因。
+                            DiagLog.write("原文件路径回写 pending 失败：\(error.localizedDescription)"
+                                          + "（本次录音已入库 \(r.relPath)；若随后写笔记失败，重试可能再转一份）")
+                        }
                         DiagLog.write("原文件已入库：\(r.relPath)"
                                       + "（\(RecordingArchive.mb(r.bytes))，\(Memo.clock(r.seconds))）")
                     } catch {
@@ -3205,6 +3212,9 @@ final class MemoSession {
                                         source: "record",
                                         createdAt: Date(),
                                         attempts: 0,
+                                        // 正常归档优先用这条 pending，漏传就等于
+                                        // 「界面说已标注、笔记里却什么都没有」
+                                        transcriptIncomplete: r.incomplete,
                                         aiState: AIConfigStore.config.enabled ? .pending : nil)
                     do {
                         try PendingStore.enqueue(m)
@@ -6980,6 +6990,19 @@ enum SelfTest {
             let old = try? dec.decode(PendingMemo.self, from: Data(json.utf8))
             check("旧 pending 无 aiState 也能解码", old != nil && old?.ai == .off)
             check("旧 pending 的 scene 解释为 transcript", old?.scene == .transcript)
+            // 1.7.1：旧 pending 没有 transcriptIncomplete 键，必须解释成「完整」。
+            // 反过来（缺键当不完整）会让老队列里每一条都在笔记里冒出一行
+            // 「转写完整: false」，等于把正常的旧笔记全标脏。
+            check("旧 pending 缺 transcriptIncomplete 视为完整", old?.transcriptComplete == true)
+
+            let json2 = """
+            {"id":"y","text":"t","duration":1,"target":"00-收件箱","vaultPath":"/tmp/v",\
+            "engine":"e","audioPath":"","source":"record","createdAt":"2026-11-05T00:00:00Z",\
+            "attempts":0,"transcriptIncomplete":true}
+            """
+            let dec2 = try? dec.decode(PendingMemo.self, from: Data(json2.utf8))
+            check("带不完整标记的 pending 能解码且判定为不完整",
+                  dec2?.transcriptIncomplete == true && dec2?.transcriptComplete == false)
         }
 
         // ===== 1.7.0 三场景 / 独占发布 / 新布局 =====
